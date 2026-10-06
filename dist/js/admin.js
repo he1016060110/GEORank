@@ -1,3 +1,4 @@
+// Fork modification (he1016060110, 2026-10-06): same-origin API and verified company pipeline.
 /**
  * GEOrank Admin — 后台管理系统核心 JS
  * 覆盖：认证守卫、API 封装、Toast/Confirm、侧边栏、各页面数据加载
@@ -6,10 +7,8 @@
     'use strict';
 
     // ─── 配置 ───────────────────────────────────────────────────────────────
-    // 本地 3001 端口时指向 8000；生产走 Traefik 同域路由
-    const API_BASE = ['80', '443', ''].includes(window.location.port)
-        ? ''
-        : `${window.location.protocol}//${window.location.hostname}:8000`;
+    // 始终使用公开入口的同源 /api/ 代理，不推断内部服务端口。
+    const API_BASE = '';
     const APP_ORIGIN = window.location.origin;
 
     const TOKEN_KEY = 'georank_admin_token';
@@ -208,9 +207,37 @@
         if (res.status === 204) return null;
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-            throw new Error(formatApiErrorDetail(data.detail || data, `请求失败 (${res.status})`));
+            const error = new Error(formatApiErrorDetail(data.detail || data, `请求失败 (${res.status})`));
+            error.status = res.status;
+            error.detail = data.detail || data;
+            throw error;
         }
         return data;
+    }
+
+    // 保存与观察共用有界请求；响应体读取也包含在同一时间预算中。
+    async function boundedAdminRequest(method, path, body, budgetMs = 15000) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), budgetMs);
+        try {
+            const headers = { 'Content-Type': 'application/json' };
+            const token = Auth.get();
+            if (token) headers.Authorization = `Bearer ${token}`;
+            const response = await fetch(`${API_BASE}${path}`, {
+                method, headers, signal: controller.signal,
+                ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+            });
+            const data = await response.json();
+            if (!response.ok) {
+                const error = new Error(formatApiErrorDetail(data.detail || data, `请求失败 (${response.status})`));
+                error.status = response.status;
+                error.detail = data.detail || data;
+                throw error;
+            }
+            return data;
+        } finally {
+            clearTimeout(timer);
+        }
     }
 
     async function apiForm(method, path, formData) {
@@ -569,14 +596,30 @@
     }
 
     // ─── 工具函数 ────────────────────────────────────────────────────────────
+    function parseAdminDate(value) {
+        if (!value) return null;
+        let normalized = value;
+        if (typeof value === 'string') {
+            normalized = value.trim();
+            // API timestamps without an offset are stored as UTC, not browser-local time.
+            // Date-only values and explicit Z/offset timestamps keep their original semantics.
+            const naiveUtc = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2}(?:\.\d+)?)$/.exec(normalized);
+            if (naiveUtc) normalized = `${naiveUtc[1]}T${naiveUtc[2]}Z`;
+        }
+        const date = new Date(normalized);
+        return Number.isFinite(date.getTime()) ? date : null;
+    }
+
     function formatDate(iso) {
-        if (!iso) return '--';
-        return new Date(iso).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' });
+        const date = parseAdminDate(iso);
+        if (!date) return '--';
+        return date.toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' });
     }
 
     function timeAgo(iso) {
-        if (!iso) return '--';
-        const diff = Date.now() - new Date(iso).getTime();
+        const date = parseAdminDate(iso);
+        if (!date) return '--';
+        const diff = Date.now() - date.getTime();
         const m = Math.floor(diff / 60000);
         if (m < 1) return '刚刚';
         if (m < 60) return `${m} 分钟前`;
@@ -735,6 +778,123 @@
         vectorizing: '<span class="badge badge-info">向量化</span>',
         failed: '<span class="badge badge-error">失败</span>',
     };
+
+    const ACTIVE_COMPANY_PIPELINE_STATES = new Set(['pending', 'crawling', 'cleaning', 'graph_building', 'vectorizing']);
+    const companyRetryFlights = new Set();
+    const companyRetryUnknown = new Set();
+
+    function getCompanyPipelineQuality(company) {
+        const quality = company?.pipeline_quality || company?.geo_details?.pipeline_quality;
+        return quality && typeof quality === 'object' && !Array.isArray(quality) ? quality : null;
+    }
+
+    function isCompanyStageVerified(name, stage) {
+        if (!stage || stage.status !== 'complete') return false;
+        if (name === 'crawl') return Number(stage.document_count) > 0;
+        if (name === 'clean') return stage.verified === true;
+        if (name === 'graph') return stage.verified === true && Number(stage.entity_count) > 0;
+        if (name === 'vector') return stage.verified === true && Number(stage.vector_count) > 0;
+        return false;
+    }
+
+    function isCompanyPipelineVerified(company) {
+        const quality = getCompanyPipelineQuality(company);
+        const stages = quality?.stages;
+        return quality?.status === 'complete' && !company.pipeline_error
+            && ['crawl', 'clean', 'graph', 'vector'].every(name => isCompanyStageVerified(name, stages?.[name]));
+    }
+
+    function renderCompanyPipelineBadge(company) {
+        const status = company?.pipeline_status || 'unknown';
+        if (status !== 'completed') return PIPELINE_BADGE[status] || escapeHtml(status);
+        const quality = getCompanyPipelineQuality(company);
+        if (!quality) return '<span class="badge badge-warning">待核验（旧完成状态）</span>';
+        if (!isCompanyPipelineVerified(company)) return '<span class="badge badge-error">成果未通过校验</span>';
+        return '<span class="badge badge-success">成果校验通过</span>';
+    }
+
+    function canReanalyzeCompany(company) {
+        return !ACTIVE_COMPANY_PIPELINE_STATES.has(company?.pipeline_status)
+            && !companyRetryFlights.has(company?.id);
+    }
+
+    function renderCompanyPipelineQuality(company) {
+        const quality = getCompanyPipelineQuality(company);
+        if (!quality) return '<p class="text-xs text-amber-700">尚无分阶段成果校验回执。旧“已完成”不证明图谱或向量已入库；请重新分析后核验。</p>';
+        const stageLabels = { crawl: '官网正文抓取', clean: '企业资料提取', graph: '知识图谱', vector: '向量知识库' };
+        const statusLabels = { complete: '成果已保存', failed: '失败', running: '处理中', pending: '等待处理' };
+        const stages = quality.stages && typeof quality.stages === 'object' ? quality.stages : {};
+        const items = Object.entries(stages).map(([name, value]) => {
+            const stage = value && typeof value === 'object' ? value : { status: String(value) };
+            const passed = isCompanyStageVerified(name, stage);
+            const label = stageLabels[name] || name;
+            return `<li class="rounded-lg border border-slate-100 p-3 text-xs break-words"><div class="flex flex-wrap items-center gap-2"><strong>${escapeHtml(label)}</strong><span class="badge ${passed ? 'badge-success' : stage.status === 'failed' ? 'badge-error' : 'badge-neutral'}">${passed ? '校验通过' : escapeHtml(stage.status === 'complete' ? '成果待核验' : statusLabels[stage.status] || stage.status || '待核验')}</span></div>${stage.error ? `<p class="mt-2 text-red-600">${escapeHtml(stage.error)}</p>` : ''}${stage.entity_count != null ? `<p class="mt-2">已读回实体 ${escapeHtml(stage.entity_count)} 个${stage.relationship_count != null ? ` · 关系 ${escapeHtml(stage.relationship_count)} 条` : ''}</p>` : ''}${stage.vector_count != null ? `<p class="mt-2">已读回向量 ${escapeHtml(stage.vector_count)} 条 · ${escapeHtml(stage.dimensions || '--')} 维</p><p class="mt-1 break-all">${escapeHtml(stage.collection || '')}</p>` : ''}${stage.document_count != null ? `<p class="mt-2">正文来源 ${escapeHtml(stage.document_count)} 页</p>` : ''}<details class="mt-2"><summary class="cursor-pointer text-primary">查看阶段来源与成果回执</summary><pre class="mt-2 whitespace-pre-wrap break-all text-[11px] text-slate-500">${escapeHtml(JSON.stringify(stage, null, 2).slice(0, 6000))}${JSON.stringify(stage).length > 6000 ? '\n（完整证据保留在服务器执行回执，此处有界展示。）' : ''}</pre></details></li>`;
+        });
+        return `<div class="space-y-3 text-xs"><p class="${isCompanyPipelineVerified(company) ? 'text-slate-500' : 'text-red-600'}">${isCompanyPipelineVerified(company) ? '以下为最近一次执行保存的成果回执，不是实时存储健康检测。' : '必需成果尚未全部通过，不能按成功审核发布。'}</p>${items.length ? `<ul class="grid grid-cols-1 sm:grid-cols-2 gap-3">${items.join('')}</ul>` : '<p>服务器未返回详细阶段证据，仍待核验。</p>'}</div>`;
+    }
+
+    async function observeCompanyRetry(companyId) {
+        const detail = await boundedAdminRequest('GET', `/api/admin/companies/${encodeURIComponent(companyId)}`);
+        const status = detail?.pipeline_status;
+        if (detail?.pipeline_dispatch?.state === 'unknown') {
+            companyRetryUnknown.add(companyId);
+            toast('服务器保存了任务标识，但派发仍未知；仅观察，不重复派发。', 'warning');
+        } else if (ACTIVE_COMPANY_PIPELINE_STATES.has(status)) {
+            companyRetryUnknown.delete(companyId);
+            toast('已观察到任务进入处理状态，仅查看进度，不重复派发。', 'warning');
+        } else {
+            toast('已读取公司状态；上次派发结果仍不确定，没有重新提交。', 'warning');
+        }
+        await loadCompanies();
+        return detail;
+    }
+
+    async function reanalyzeCompany(companyId) {
+        if (companyRetryFlights.has(companyId)) return;
+        companyRetryFlights.add(companyId);
+        try {
+            if (companyRetryUnknown.has(companyId)) {
+                await observeCompanyRetry(companyId);
+                return;
+            }
+            if (!await confirm('重新分析会沿用当前公司 ID，保留原始来源，重新调用已配置的 AI 模型，可能产生费用；不会自动审核或发布。确认重新分析？')) return;
+            // 确认后先读当前状态，防止另一标签页已派发。
+            const current = await boundedAdminRequest('GET', `/api/admin/companies/${encodeURIComponent(companyId)}`);
+            if (current?.pipeline_dispatch?.state === 'unknown') {
+                companyRetryUnknown.add(companyId);
+                await observeCompanyRetry(companyId);
+                return;
+            }
+            if (ACTIVE_COMPANY_PIPELINE_STATES.has(current?.pipeline_status)) {
+                toast('这家公司已有进行中的任务，仅查看进度，不重复提交。', 'warning');
+                await loadCompanies();
+                return;
+            }
+            try {
+                const receipt = await boundedAdminRequest('POST', `/api/admin/companies/${encodeURIComponent(companyId)}/retry-pipeline`);
+                if (receipt?.dispatch_state === 'unknown' || receipt?.status === 'dispatch_unknown') {
+                    companyRetryUnknown.add(companyId);
+                    toast('服务器已记录派发未知回执；仅观察此任务，不再次派发。', 'warning');
+                    await observeCompanyRetry(companyId);
+                    return;
+                }
+                toast('重新分析已派发；等待真实阶段成果，尚未审核或发布。');
+            } catch (error) {
+                if (error.status === 409 || !error.status || error.status >= 500 || error.status === 408) {
+                    companyRetryUnknown.add(companyId);
+                    toast(error.status === 409 ? '已有任务或派发状态冲突，正在只读核验。' : '派发回执未知；先只读观察，不重发收费任务。', 'warning');
+                    await observeCompanyRetry(companyId);
+                    return;
+                }
+                throw error;
+            }
+            await loadCompanies();
+        } catch (error) {
+            toast(error.message || '无法读取任务状态；没有重复提交。', 'error');
+        } finally {
+            companyRetryFlights.delete(companyId);
+        }
+    }
 
     const CONTENT_TYPE_LABEL = {
         tutorial: '教程', template: '方案模板', whitepaper: '白皮书', announcement: '公告',
@@ -1400,10 +1560,10 @@ ${rows.slice(0, 3).map(item => {
         const badgeEl = document.getElementById('company-detail-badge');
         if (!detailPanel || !badgeEl) return;
 
-        badgeEl.innerHTML = PIPELINE_BADGE[detail.pipeline_status] || escapeHtml(detail.pipeline_status || 'unknown');
+        badgeEl.innerHTML = renderCompanyPipelineBadge(detail);
 
         const geoDetails = detail.geo_details && typeof detail.geo_details === 'object'
-            ? Object.entries(detail.geo_details).slice(0, 4)
+            ? Object.entries(detail.geo_details).filter(([key]) => !key.startsWith('pipeline_')).slice(0, 4)
             : [];
         const latestDiagnostic = detail.latest_diagnostic;
         const relatedSolutions = Array.isArray(detail.related_solutions) ? detail.related_solutions : [];
@@ -1440,10 +1600,10 @@ ${rows.slice(0, 3).map(item => {
                 <span class="material-symbols-outlined text-sm">cancel</span>
                 驳回
             </button>` : ''}
-            ${detail.pipeline_status === 'failed' ? `
+            ${canReanalyzeCompany(detail) ? `
             <button class="btn admin-btn-secondary px-4 py-2 rounded-lg text-sm inline-flex items-center gap-1.5" data-company-detail-action="retry" data-id="${detail.id}">
                 <span class="material-symbols-outlined text-sm">refresh</span>
-                重试流水线
+                重新分析（可能计费）
             </button>` : ''}
             <button class="btn admin-btn-secondary px-4 py-2 rounded-lg text-sm inline-flex items-center gap-1.5 text-red-500 hover:text-red-600" data-company-detail-action="delete" data-id="${detail.id}">
                 <span class="material-symbols-outlined text-sm">delete</span>
@@ -1490,13 +1650,14 @@ ${rows.slice(0, 3).map(item => {
     <section class="admin-detail-section p-5">
         <h4 class="text-sm font-bold text-slate-900 mb-3">流水线与存储</h4>
         <dl class="admin-detail-meta">
-            ${renderMetaItem('入库状态', PIPELINE_BADGE[detail.pipeline_status] || escapeHtml(detail.pipeline_status))}
+            ${renderMetaItem('入库状态', renderCompanyPipelineBadge(detail))}
             ${renderMetaItem('发布状态', PUBLISH_BADGE[detail.publish_status] || escapeHtml(detail.publish_status))}
             ${renderMetaItem('错误信息', escapeHtml(detail.pipeline_error || '--'), detail.pipeline_error ? 'text-red-500' : '')}
             ${renderMetaItem('原始 HTML', escapeHtml(detail.raw_html_key || '--'))}
             ${renderMetaItem('About HTML', escapeHtml(detail.about_html_key || '--'))}
             ${renderMetaItem('截图数量', escapeHtml(String((detail.screenshots || []).length)))}
         </dl>
+        <div class="mt-4">${renderCompanyPipelineQuality(detail)}</div>
     </section>
 
     <section class="admin-detail-section p-5">
@@ -1605,8 +1766,8 @@ ${rows.slice(0, 3).map(item => {
                 await api('POST', `/api/admin/companies/${companyId}/reject`);
                 toast('已驳回', 'warning');
             } else if (action === 'retry') {
-                await api('POST', `/api/admin/companies/${companyId}/retry-pipeline`);
-                toast('已重新触发流水线');
+                await reanalyzeCompany(companyId);
+                return;
             } else if (action === 'delete') {
                 if (!await confirm('确认删除这家公司？此操作会同时删除关联投票和诊断记录，且不可恢复。')) return;
                 await api('DELETE', `/api/admin/companies/${companyId}`);
@@ -1709,7 +1870,7 @@ ${rows.slice(0, 3).map(item => {
     </td>
     <td><span class="tag text-[10px]">${escapeHtml(c.category || '--')}</span></td>
     <td>
-        ${PIPELINE_BADGE[c.pipeline_status] || escapeHtml(c.pipeline_status)}
+        ${renderCompanyPipelineBadge(c)}
         ${c.pipeline_status === 'failed' && c.pipeline_error ? `<p class="text-[10px] text-red-500 mt-1 max-w-[170px] truncate" title="${escapeHtml(c.pipeline_error)}">${escapeHtml(c.pipeline_error)}</p>` : ''}
     </td>
     <td>${PUBLISH_BADGE[c.publish_status] || escapeHtml(c.publish_status)}</td>
@@ -1724,8 +1885,8 @@ ${rows.slice(0, 3).map(item => {
             <button class="btn-reject w-8 h-8 flex items-center justify-center rounded-md hover:bg-red-50 transition-colors" title="驳回" data-id="${c.id}">
                 <span class="material-symbols-outlined text-slate-400 hover:text-red-500 text-lg">cancel</span>
             </button>` : ''}
-            ${c.pipeline_status === 'failed' ? `
-            <button class="btn-retry w-8 h-8 flex items-center justify-center rounded-md hover:bg-orange-50 transition-colors" title="重试流水线" data-id="${c.id}">
+            ${canReanalyzeCompany(c) ? `
+            <button class="btn-retry w-8 h-8 flex items-center justify-center rounded-md hover:bg-orange-50 transition-colors" title="重新分析（可能产生模型费用）" data-id="${c.id}">
                 <span class="material-symbols-outlined text-slate-400 hover:text-orange-500 text-lg">refresh</span>
             </button>` : ''}
             <button class="btn-delete w-8 h-8 flex items-center justify-center rounded-md hover:bg-red-50 transition-colors" title="删除公司" data-id="${c.id}">
@@ -4277,8 +4438,188 @@ ${pages.map(p => p === '…'
     }
 
     // ─── 系统设置页 ──────────────────────────────────────────────────────────
+    // Embedding 独立脱敏接口：保存配置不测试模型，不修改 LLM API 池。
+    const EMBEDDING_SETTING_FIELDS = ['provider', 'base_url', 'model', 'dimensions', 'collection'];
+    const EMBEDDING_FIELD_IDS = {
+        provider: 'embedding-provider', base_url: 'embedding-base-url', model: 'embedding-model',
+        dimensions: 'embedding-dimensions', collection: 'embedding-collection',
+    };
+    const LOCAL_EMBEDDING_DEFAULTS = {
+        provider: 'local_tei', base_url: 'http://host.docker.internal:45310/v1',
+        model: 'intfloat/multilingual-e5-small', dimensions: 384, collection: 'companies_e5_small_v1',
+    };
+    const embeddingFormState = { snapshot: null, editVersion: 0, flight: null, unknownWrite: null, remoteDraft: null };
+
+    function setEmbeddingMessage(message, tone = 'neutral') {
+        const element = document.getElementById('embedding-status');
+        if (!element) return;
+        element.textContent = message;
+        element.className = `text-xs break-words ${tone === 'error' ? 'text-red-600' : tone === 'warning' ? 'text-amber-700' : 'text-slate-500'}`;
+    }
+
+    function collectEmbeddingSettings() {
+        const payload = {};
+        EMBEDDING_SETTING_FIELDS.forEach(key => {
+            const element = document.getElementById(EMBEDDING_FIELD_IDS[key]);
+            payload[key] = key === 'dimensions' ? Number(element?.value) : String(element?.value || '').trim();
+        });
+        const key = document.getElementById('embedding-api-key')?.value?.trim();
+        // 留空表示保留服务器密钥；本地服务无需Key，绝不把占位符当密钥。
+        if (payload.provider === 'remote' && key) payload.api_key = key;
+        return payload;
+    }
+
+    function refreshEmbeddingProviderControls() {
+        const local = document.getElementById('embedding-provider')?.value === 'local_tei';
+        const key = document.getElementById('embedding-api-key');
+        if (key) key.disabled = local;
+        const keyState = document.getElementById('embedding-key-state');
+        if (keyState) keyState.textContent = local
+            ? '本机 TEI 模式免 Key，不新增远端模型费用。'
+            : embeddingFormState.snapshot?.has_api_key
+                ? '服务器已配置密钥；留空保留，不回显。' : '远端服务未配置密钥。';
+        const note = document.getElementById('embedding-local-note');
+        if (note) note.classList.toggle('hidden', !local);
+    }
+
+    function applyEmbeddingSettings(payload) {
+        if (!payload || typeof payload !== 'object') return;
+        EMBEDDING_SETTING_FIELDS.forEach(key => {
+            const element = document.getElementById(EMBEDDING_FIELD_IDS[key]);
+            if (element) element.value = payload[key] == null ? '' : String(payload[key]);
+        });
+        // GET只应用非敏感字段；任何返回值均不能灌入密钥输入框。
+        refreshEmbeddingProviderControls();
+    }
+
+    function embeddingMetadataMatches(expected, observed) {
+        return EMBEDDING_SETTING_FIELDS.every(key => String(expected[key] ?? '') === String(observed?.[key] ?? ''));
+    }
+
+    function updateEmbeddingButton() {
+        const save = document.getElementById('embedding-save');
+        if (!save) return;
+        save.disabled = Boolean(embeddingFormState.flight || embeddingFormState.unknownWrite || !embeddingFormState.snapshot);
+        save.textContent = embeddingFormState.flight ? '处理中...' : '保存向量配置';
+    }
+
+    async function loadEmbeddingSettings() {
+        if (embeddingFormState.flight) return;
+        const version = embeddingFormState.editVersion;
+        embeddingFormState.flight = 'read';
+        updateEmbeddingButton();
+        try {
+            const observed = await boundedAdminRequest('GET', '/api/admin/settings/embedding');
+            embeddingFormState.snapshot = observed;
+            if (embeddingFormState.unknownWrite) {
+                const pending = embeddingFormState.unknownWrite;
+                if (embeddingMetadataMatches(pending.metadata, observed) && !pending.keyChanged) {
+                    embeddingFormState.unknownWrite = null;
+                    setEmbeddingMessage('已只读确认配置已保存。没有重复写入，也没有调用模型。');
+                } else {
+                    setEmbeddingMessage(pending.keyChanged
+                        ? '保存回执未知：已读取非敏感配置，但不能用 has_api_key 推断新密钥已写入。不会自动重发；请保留草稿并检查服务器回执。'
+                        : '保存回执仍未知，当前服务器配置与本次草稿不一致。不会自动重复保存。', 'warning');
+                }
+            } else if (version === embeddingFormState.editVersion) {
+                applyEmbeddingSettings(observed);
+                const readiness = observed.readiness;
+                const status = typeof readiness === 'string' ? readiness : readiness?.state;
+                const readinessLabel = status === 'blocked' ? '配置阻断' : status === 'configured' ? '配置已保存（连接未核验）' : status;
+                const issues = Array.isArray(readiness?.issues) ? readiness.issues.join('；') : '';
+                setEmbeddingMessage(`当前配置来源：${observed.provider === 'local_tei' ? '本机 TEI（免 Key）' : '远端 OpenAI 兼容服务'}。${readinessLabel ? `配置状态：${readinessLabel}。` : ''}${issues ? `原因：${issues}。` : ''}保存不执行模型测试或重建；真实向量成果以公司执行回执为准。`);
+            } else {
+                setEmbeddingMessage('已读取服务器配置；保留你正在编辑的草稿，未用迟到响应覆盖。');
+            }
+            refreshEmbeddingProviderControls();
+        } catch (error) {
+            setEmbeddingMessage(`读取向量配置失败：${error.message}。没有修改 DeepSeek 或其他设置。`, 'error');
+        } finally {
+            embeddingFormState.flight = null;
+            updateEmbeddingButton();
+        }
+    }
+
+    async function saveEmbeddingSettings() {
+        if (embeddingFormState.flight) return;
+        if (embeddingFormState.unknownWrite) {
+            await loadEmbeddingSettings();
+            return;
+        }
+        const payload = collectEmbeddingSettings();
+        if (!['local_tei', 'remote'].includes(payload.provider) || !payload.base_url || !payload.model
+            || !payload.collection || !Number.isInteger(payload.dimensions) || payload.dimensions < 1 || payload.dimensions > 8192) {
+            setEmbeddingMessage('请完整填写服务来源、Base URL、模型、真实整数维度和隔离集合。', 'error');
+            return;
+        }
+        const version = embeddingFormState.editVersion;
+        const sentKey = document.getElementById('embedding-api-key')?.value || '';
+        embeddingFormState.flight = 'write';
+        updateEmbeddingButton();
+        try {
+            const result = await boundedAdminRequest('PUT', '/api/admin/settings/embedding', payload);
+            embeddingFormState.snapshot = result;
+            if (version === embeddingFormState.editVersion) {
+                applyEmbeddingSettings(result);
+                const key = document.getElementById('embedding-api-key');
+                if (key && key.value === sentKey && payload.api_key) key.value = '';
+                setEmbeddingMessage('向量配置已保存。未调用模型、未重建向量库、未修改 LLM API 池；旧集合保留。');
+            } else {
+                setEmbeddingMessage('这次配置已保存；你在保存期间的新草稿仍保留，不被迟到响应覆盖。');
+            }
+            refreshEmbeddingProviderControls();
+        } catch (error) {
+            if (!error.status || error.status >= 500 || error.status === 408) {
+                // 仅记录非敏感元数据。未知写只能只读核验，不能自动重PUT。
+                const metadata = {};
+                EMBEDDING_SETTING_FIELDS.forEach(key => { metadata[key] = payload[key]; });
+                embeddingFormState.unknownWrite = { metadata, keyChanged: Boolean(payload.api_key) };
+                setEmbeddingMessage('保存回执未知（不等于未保存）。请点“读取服务器状态”只读核验；不会重复写入或调用模型。', 'warning');
+            } else {
+                setEmbeddingMessage(`向量配置未获成功回执：${error.message}。草稿保留，其他 API 设置未更改。`, 'error');
+            }
+        } finally {
+            embeddingFormState.flight = null;
+            updateEmbeddingButton();
+        }
+    }
+
+    function initEmbeddingSettings() {
+        const provider = document.getElementById('embedding-provider');
+        if (!provider) return;
+        const dirty = () => { embeddingFormState.editVersion += 1; };
+        const fields = [...Object.values(EMBEDDING_FIELD_IDS), 'embedding-api-key'];
+        fields.forEach(id => {
+            const element = document.getElementById(id);
+            if (element && element.dataset.embeddingBound !== 'true') {
+                element.addEventListener('input', dirty);
+                element.dataset.embeddingBound = 'true';
+            }
+        });
+        if (provider.dataset.embeddingChangeBound !== 'true') {
+            provider.addEventListener('change', () => {
+                if (provider.value === 'local_tei') {
+                    const draft = collectEmbeddingSettings();
+                    embeddingFormState.remoteDraft = Object.fromEntries(EMBEDDING_SETTING_FIELDS.map(key => [key, key === 'provider' ? 'remote' : draft[key]]));
+                    applyEmbeddingSettings(LOCAL_EMBEDDING_DEFAULTS);
+                } else if (embeddingFormState.remoteDraft) {
+                    applyEmbeddingSettings(embeddingFormState.remoteDraft);
+                }
+                dirty();
+                refreshEmbeddingProviderControls();
+            });
+            provider.dataset.embeddingChangeBound = 'true';
+        }
+        const save = document.getElementById('embedding-save');
+        if (save) save.onclick = saveEmbeddingSettings;
+        const refresh = document.getElementById('embedding-refresh');
+        if (refresh) refresh.onclick = loadEmbeddingSettings;
+        loadEmbeddingSettings();
+    }
+
     async function initSettings() {
         renderTopbar('系统设置');
+        initEmbeddingSettings(); // 与全页设置加载/保存分离，慢状态不阻塞其他配置。
 
         let settings = {};
         try {

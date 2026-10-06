@@ -1,3 +1,4 @@
+# Fork modification (he1016060110, 2026-10-06): verified company extraction and local embedding pipeline.
 """
 公司模块 Schemas
 """
@@ -76,6 +77,9 @@ class SubmitCompanyResponse(BaseModel):
     normalized_url: Optional[str] = None
     publish_status: Optional[str] = None
     resumed: bool = False
+    task_id: Optional[str] = None
+    dispatch_state: Optional[str] = None
+    observe_only: bool = False
 
 
 class PipelineSelectedPage(BaseModel):
@@ -95,6 +99,9 @@ class PipelineStatusResponse(BaseModel):
     publish_status: Optional[str] = None
     company_name: Optional[str] = None
     company_summary: Optional[str] = None
+    company_url: Optional[str] = None
+    pipeline_quality: Optional[dict] = None
+    pipeline_dispatch: Optional[dict] = None
     selected_pages: list[PipelineSelectedPage] = Field(default_factory=list)
 
 

@@ -1,3 +1,4 @@
+// Fork modification (he1016060110, 2026-10-06): same-origin API and verified company pipeline.
 /**
  * 提交公司完整分析页
  * - 新标签页展示完整 AI 分析过程
@@ -6,19 +7,19 @@
 (function () {
     'use strict';
 
-    const API_BASE = ['80', '443', ''].includes(window.location.port)
-        ? ''
-        : `${window.location.protocol}//${window.location.hostname}:8000`;
+    const API_BASE = '';
 
     const stepOrder = ['crawl', 'clean', 'graph', 'vector'];
     const statusMap = {
         pending: { active: 0, completed: -1, note: '已创建任务，等待进入官网解析队列。', activity: '正在创建分析任务并加入处理队列...' },
         crawling: { active: 0, completed: -1, note: '正在抓取官网首页和一级目录，AI 将锁定最值得深入的页面。', activity: '正在解析官网首页并识别一级目录链接...' },
         cleaning: { active: 1, completed: 0, note: '关键页面已锁定，正在抽取企业介绍、产品与团队信息。', activity: '正在整合关键页面内容并结构化抽取企业信息...' },
-        graph_building: { active: 2, completed: 1, note: '结构化数据准备就绪，正在构建知识图谱。', activity: '正在构建实体关系与企业知识图谱...' },
-        vectorizing: { active: 3, completed: 2, note: '知识图谱已生成，正在写入向量知识库。', activity: '正在将企业知识写入语义检索索引...' },
+        graph_building: { active: 2, completed: 1, note: '正在构建知识图谱，各阶段成果以保存的核验回执为准。', activity: '正在构建实体关系与企业知识图谱...' },
+        vectorizing: { active: 3, completed: 2, note: '正在写入向量知识库，图谱与向量成果须分别核验。', activity: '正在将企业知识写入语义检索索引...' },
         completed: { active: -1, completed: 3, note: 'AI 分析完成，结果当前仍为草稿，点击提交审核后才会进入后台审核。', activity: '企业知识库构建完成，等待你确认提交审核。' },
-        failed: { active: -1, completed: -1, note: '本次分析失败，可重新发起分析。', activity: '分析未成功完成。' },
+        failed: { active: -1, completed: -1, note: '本次分析未通过质量核验，请在后台查看失败阶段并重新分析。', activity: '分析未成功完成。' },
+        dispatch_unknown: { active: -1, completed: -1, note: '派发回执尚未确认，任务可能已进入队列；只观察同一任务，不要重复提交。', activity: '等待同一任务的派发与处理回执，当前不代表分析失败。' },
+        unknown: { active: -1, completed: -1, note: '记录曾标为完成，但缺少完整质量核验回执；不能认定知识库已完成或提交审核。', activity: '企业资料、图谱和向量成果待核验。' },
     };
 
     const analysisUrl = document.getElementById('analysis-url');
@@ -42,6 +43,9 @@
     let seenFeedKeys = new Set();
     let currentCompanyId = '';
     let currentNormalizedUrl = '';
+    let currentEffectiveStatus = 'pending';
+    let currentPublishStatus = 'draft';
+    const loadedPreviewIds = new Set();
 
     function getAuthToken() {
         return localStorage.getItem('georank_user_token')
@@ -133,6 +137,14 @@
             return;
         }
 
+        if (state === 'unknown') {
+            iconBg.className = 'w-10 h-10 rounded-2xl bg-amber-50 flex items-center justify-center shrink-0';
+            iconEl.className = 'material-symbols-outlined text-amber-600 text-lg';
+            statusIcon.textContent = 'help';
+            statusIcon.className = 'material-symbols-outlined text-amber-600 text-lg step-icon';
+            return;
+        }
+
         iconBg.className = 'w-10 h-10 rounded-2xl bg-slate-100 flex items-center justify-center shrink-0';
         iconEl.className = 'material-symbols-outlined text-slate-400 text-lg';
         statusIcon.textContent = 'circle';
@@ -165,6 +177,8 @@
     }
 
     function updateReviewState(status, publishStatus) {
+        submitReviewBtn.classList.add('hidden');
+        submitReviewBtn.disabled = true;
         if (openAdminReviewBtn) {
             openAdminReviewBtn.classList.add('hidden');
             if (currentCompanyId) {
@@ -172,42 +186,61 @@
             }
         }
 
+        const qualityWarning = status === 'failed'
+            ? '但本轮分析未通过质量核验，请先检查失败阶段，不要直接审核通过。'
+            : status === 'unknown'
+                ? '但知识库质量尚无完整核验回执，不代表全部成果已经完成。'
+                : status !== 'completed'
+                    ? '本轮分析仍在进行中，发布状态与知识库处理进度分别记录。'
+                    : '';
+
+        // Publication is an existing fact, not evidence that the latest run passed.
+        if (publishStatus === 'pending_review' || publishStatus === 'published') {
+            const published = publishStatus === 'published';
+            reviewStatusTitle.textContent = published ? '已发布' : '已提交审核';
+            reviewStatusCopy.textContent = (published
+                ? '该公司已通过审核并在前台目录中展示。'
+                : '资料已经进入后台审核队列，审核与流水线质量是独立状态。') + qualityWarning;
+            openAdminReviewBtn?.classList.remove('hidden');
+            updateBadge(status === 'failed' ? '质量未通过'
+                : status === 'unknown' ? '质量待核验'
+                    : published ? '已发布' : '审核中',
+            status === 'failed' ? 'error' : status === 'completed' && published ? 'success' : 'warning');
+            return;
+        }
+
+        if (status === 'dispatch_unknown') {
+            reviewStatusTitle.textContent = '任务派发待确认';
+            reviewStatusCopy.textContent = '原任务可能已经进入队列，系统仅观察原公司和任务标识；请勿重复提交或创建新任务。';
+            openAdminReviewBtn?.classList.remove('hidden');
+            updateBadge('派发待确认', 'warning');
+            return;
+        }
         if (status === 'failed') {
             reviewStatusTitle.textContent = '分析失败';
-            reviewStatusCopy.textContent = '本次官网解析未成功完成。你可以返回首页重新发起一轮分析。';
-            submitReviewBtn.classList.add('hidden');
-            return;
-        }
-
-        if (publishStatus === 'pending_review') {
-            reviewStatusTitle.textContent = '已提交审核';
-            reviewStatusCopy.textContent = '分析结果已经进入后台审核队列，审核通过后前台公司目录会自动展示。';
-            submitReviewBtn.classList.add('hidden');
+            reviewStatusCopy.textContent = '本次分析未通过质量核验。请在后台检查失败阶段并重新分析，不会自动提交审核。';
             openAdminReviewBtn?.classList.remove('hidden');
-            updateBadge('审核中', 'warning');
+            updateBadge('质量未通过', 'error');
             return;
         }
-
-        if (publishStatus === 'published') {
-            reviewStatusTitle.textContent = '已发布';
-            reviewStatusCopy.textContent = '该公司已通过审核并在前台目录中展示。';
-            submitReviewBtn.classList.add('hidden');
+        if (status === 'unknown') {
+            reviewStatusTitle.textContent = '质量待核验';
+            reviewStatusCopy.textContent = '历史“已完成”不能替代质量回执。企业资料、图谱和向量成果核验齐全后才能提交审核。';
             openAdminReviewBtn?.classList.remove('hidden');
-            updateBadge('已发布', 'success');
+            updateBadge('质量待核验', 'warning');
             return;
         }
-
         if (status === 'completed') {
             reviewStatusTitle.textContent = '等待你确认提交';
-            reviewStatusCopy.textContent = 'AI 分析已经完成，但结果仍停留在草稿状态。点击下方按钮后才会进入后台审核。';
+            reviewStatusCopy.textContent = '企业资料、图谱和向量成果已经核验，但结果仍停留在草稿状态。点击下方按钮后才会进入后台审核。';
             submitReviewBtn.classList.remove('hidden');
+            submitReviewBtn.disabled = false;
             updateBadge('待提交', 'active');
             return;
         }
 
         reviewStatusTitle.textContent = '分析进行中';
-        reviewStatusCopy.textContent = '系统正在处理官网内容并构建企业知识库，完成后你可以在这里一键提交审核。';
-        submitReviewBtn.classList.add('hidden');
+        reviewStatusCopy.textContent = '系统正在处理官网内容并构建企业知识库，完成质量核验后才能提交审核。';
         updateBadge('分析中', 'active');
     }
 
@@ -272,8 +305,10 @@
             cleaning: ['clean', 'data_object', '已完成关键页抓取，正在提取企业信息与结构化摘要。'],
             graph_building: ['graph', 'hub', '正在梳理企业实体、产品能力与关系图谱。'],
             vectorizing: ['vector', 'neurology', '正在将知识内容写入语义索引，支持后续检索与推荐。'],
-            completed: ['done', 'check_circle', '企业知识库构建完成，等待你确认提交审核。'],
-            failed: ['failed', 'error', '本次分析失败，可重新发起分析。'],
+            completed: ['done', 'check_circle', '企业资料、图谱和向量成果已通过存储读回核验。'],
+            failed: ['failed', 'error', '本次分析未通过质量核验，请在后台检查失败阶段。'],
+            dispatch_unknown: ['dispatch-unknown', 'hourglass_empty', '派发回执尚未确认，仅观察同一任务，不重复派发。'],
+            unknown: ['unknown', 'help', '历史完成状态缺少完整质量回执，企业知识库成果待核验。'],
         };
         const entry = statusFeed[status];
         if (entry) {
@@ -286,54 +321,126 @@
         renderSelectedPages(selectedPages);
     }
 
-    function applyPipelineStatus(payload) {
+    function savedQuality(payload) {
+        return payload.pipeline_quality && typeof payload.pipeline_quality === 'object'
+            && !Array.isArray(payload.pipeline_quality) ? payload.pipeline_quality : null;
+    }
+
+    function qualityStage(quality, stepName) {
+        const stages = quality?.stages;
+        if (!stages || typeof stages !== 'object' || Array.isArray(stages)) return null;
+        return stepName === 'clean' ? stages.clean || stages.profile || null
+            : stepName === 'crawl' ? stages.crawl || stages.source || null
+                : stages[stepName] || null;
+    }
+
+    function stageVerified(quality, name) {
+        const stage = qualityStage(quality, name);
+        if (!stage || !['complete', 'passed'].includes(stage.status)) return false;
+        if (name === 'crawl') return Number(stage.document_count) > 0;
+        if (stage.verified !== true) return false;
+        if (name === 'clean') return true;
+        if (name === 'graph') return Number(stage.entity_count) > 0;
+        if (name === 'vector') return Number(stage.vector_count) > 0;
+        return false;
+    }
+
+    function effectiveStatus(payload, quality) {
         const status = payload.status || 'pending';
-        const config = statusMap[status] || statusMap.pending;
+        if (payload.pipeline_dispatch?.state === 'unknown' && status === 'pending') return 'dispatch_unknown';
+        const stageFailed = stepOrder.some(name => ['failed', 'degraded'].includes(qualityStage(quality, name)?.status));
+        if (payload.error || ['failed', 'degraded'].includes(quality?.status)
+            || ['failed', 'degraded'].includes(status) || stageFailed) return 'failed';
+        if (status !== 'completed') return statusMap[status] ? status : 'unknown';
+        // Top-level completion alone cannot prove durable artifact readback.
+        const allVerified = stepOrder.every(name => stageVerified(quality, name));
+        return ['complete', 'passed'].includes(quality?.status) && allVerified ? 'completed' : 'unknown';
+    }
+
+    function applyPipelineStatus(payload) {
+        const quality = savedQuality(payload);
+        const status = effectiveStatus(payload, quality);
+        const config = statusMap[status] || statusMap.unknown;
+        const selectedPages = Array.isArray(payload.selected_pages) ? payload.selected_pages : [];
+        currentEffectiveStatus = status;
+        currentPublishStatus = payload.publish_status || currentPublishStatus;
+        if (payload.company_url) {
+            currentNormalizedUrl = payload.company_url;
+            analysisUrl.textContent = payload.company_url;
+        }
 
         stepOrder.forEach((stepName, index) => {
-            if (status === 'failed') {
-                setStepState(stepName, index === stepOrder.length - 1 ? 'failed' : 'done');
-                return;
-            }
-            if (index <= config.completed) {
+            const stageStatus = qualityStage(quality, stepName)?.status;
+            if (stageVerified(quality, stepName)) {
                 setStepState(stepName, 'done');
-            } else if (index === config.active) {
+            } else if (['failed', 'degraded'].includes(stageStatus)) {
+                setStepState(stepName, 'failed');
+            } else if (stepName === 'crawl' && selectedPages.length
+                && selectedPages.every(page => page?.status === 'captured')) {
+                // Saved crawl results prove this stage; later status does not.
+                setStepState(stepName, 'done');
+            } else if (index === config.active && !['failed', 'unknown'].includes(status)) {
                 setStepState(stepName, 'active');
             } else {
-                setStepState(stepName, 'idle');
+                setStepState(stepName, ['failed', 'unknown', 'completed', 'dispatch_unknown'].includes(status)
+                    || index < config.active ? 'unknown' : 'idle');
             }
         });
 
-        updateDynamicPanels(status, payload.current_activity || null, payload.selected_pages || []);
-        updateReviewState(status, payload.publish_status);
+        const qualityError = quality?.failure?.code || ['clean', 'graph', 'vector']
+            .map(name => qualityStage(quality, name)?.error).find(Boolean);
+        const activity = status === 'unknown' ? statusMap.unknown.activity
+            : status === 'failed' ? payload.error || qualityError || payload.current_activity
+                : payload.current_activity || null;
+        updateDynamicPanels(status, activity, selectedPages);
+        if (status === 'failed' && (payload.error || qualityError)) {
+            analysisNote.textContent += ` 原因：${payload.error || qualityError}`;
+        }
+        if (status === 'completed' && ['pending_review', 'published'].includes(currentPublishStatus)) {
+            analysisNote.textContent = currentPublishStatus === 'published'
+                ? '企业资料、图谱和向量成果已核验；该公司已审核发布。'
+                : '企业资料、图谱和向量成果已核验；资料当前已提交后台审核，尚未发布。';
+        }
+        updateReviewState(status, currentPublishStatus);
+        if (status !== 'completed') companyPreviewCard.classList.add('hidden');
+        return status;
     }
 
-    async function loadCompanyPreview(companyId) {
+    async function loadCompanyPreview(companyId, payload = {}) {
+        if (currentEffectiveStatus !== 'completed') return;
+        // Prefer the saved summary from the lightweight poll; never GET a public
+        // detail just to discover quality (that endpoint may hydrate with a model).
+        if (payload.company_name && payload.company_summary) {
+            companyPreviewCard.classList.remove('hidden');
+            previewCompanyName.textContent = payload.company_name;
+            previewCompanySummary.textContent = payload.company_summary;
+            return;
+        }
+        if (loadedPreviewIds.has(companyId)) return;
+        loadedPreviewIds.add(companyId);
         try {
             const data = await request(`/api/companies/${companyId}`);
-            if (data.url) {
-                analysisUrl.textContent = data.url;
-            }
+            if (currentEffectiveStatus !== 'completed') return;
+            if (data.url) analysisUrl.textContent = data.url;
             companyPreviewCard.classList.remove('hidden');
-            previewCompanyName.textContent = data.name || '企业名称待生成';
-            previewCompanySummary.textContent = data.short_description
-                || data.description
-                || 'AI 已提炼出企业基础信息，可在提交审核后进入后台进一步检查与发布。';
+            previewCompanyName.textContent = data.name || '企业名称待核验';
+            previewCompanySummary.textContent = data.short_description || data.description || '企业摘要尚未提供。';
         } catch (_) {
-            // 忽略详情加载失败，不影响审核提交流程
+            // A preview failure cannot prove quality or trigger a repeated hydration.
         }
     }
 
     async function pollPipeline(companyId, attempt = 0) {
+        clearPolling();
         try {
             const status = await request(`/api/companies/${companyId}/pipeline-status`);
-            applyPipelineStatus(status);
-            if (status.status === 'completed') {
+            const displayedStatus = applyPipelineStatus(status);
+            if (displayedStatus === 'completed') {
                 clearPolling();
-                await loadCompanyPreview(companyId);
+                await loadCompanyPreview(companyId, status);
                 return;
             }
-            if (status.status === 'failed') {
+            if (displayedStatus === 'failed' || displayedStatus === 'unknown') {
                 clearPolling();
                 return;
             }
@@ -342,7 +449,7 @@
                 applyPipelineStatus({
                     status: 'failed',
                     current_activity: error.message,
-                    publish_status: 'draft',
+                    publish_status: currentPublishStatus,
                     selected_pages: [],
                 });
                 return;
@@ -367,9 +474,6 @@
                 analysisUrl.textContent = incomingUrl || '正在恢复分析记录...';
             }
             updateBadge('恢复中', 'active');
-            if (!incomingUrl) {
-                loadCompanyPreview(incomingCompanyId);
-            }
             await pollPipeline(incomingCompanyId);
             return;
         }
@@ -404,7 +508,9 @@
                 companyId: currentCompanyId,
             })
         );
-        if (result.resumed) {
+        if (result.dispatch_state === 'unknown' || result.status === 'dispatch_unknown') {
+            appendFeedItem('dispatch-unknown', 'hourglass_empty', '派发回执尚未确认；已保留原任务标识，仅同步进度，不重复创建。');
+        } else if (result.resumed) {
             appendFeedItem('resume', 'history', '检测到已有分析草稿，已为你恢复当前进度。');
         } else {
             appendFeedItem('created', 'hourglass_empty', '分析任务创建成功，正在同步实时进度。');
@@ -413,15 +519,16 @@
     }
 
     async function submitForReview() {
-        if (!currentCompanyId) return;
+        if (!currentCompanyId || currentEffectiveStatus !== 'completed' || submitReviewBtn.disabled) return;
         submitReviewBtn.disabled = true;
         submitReviewBtn.textContent = '提交中...';
         try {
-            await request(`/api/companies/${currentCompanyId}/submit-review`, {
+            const result = await request(`/api/companies/${currentCompanyId}/submit-review`, {
                 method: 'POST',
             });
             appendFeedItem('review-submitted', 'task_alt', '分析结果已提交后台审核，审核通过后将在前台目录中展示。');
-            updateReviewState('completed', 'pending_review');
+            currentPublishStatus = result.status === 'published' ? 'published' : 'pending_review';
+            updateReviewState(currentEffectiveStatus, currentPublishStatus);
         } catch (error) {
             reviewStatusTitle.textContent = '提交审核失败';
             reviewStatusCopy.textContent = error.message || '请稍后重试。';

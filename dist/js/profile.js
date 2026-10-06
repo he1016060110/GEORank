@@ -1,3 +1,4 @@
+// Fork modification (he1016060110, 2026-10-06): same-origin API and verified company pipeline.
 /**
  * GEOrank - 个人中心设置页
  */
@@ -11,10 +12,7 @@
     }
 
     function apiBase() {
-        return window.GEOrank?.Auth?.apiBase
-            || (['80', '443', ''].includes(window.location.port)
-                ? ''
-                : `${window.location.protocol}//${window.location.hostname}:8000`);
+        return '';
     }
 
     function modeLabel(mode) {

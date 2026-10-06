@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -16,6 +17,12 @@ class _CollectionsResponse:
 
 
 class _RacingClient:
+    def get_collection(self, **_kwargs):
+        # A 409 race is safe only after the actual collection schema is read.
+        return SimpleNamespace(config=SimpleNamespace(params=SimpleNamespace(
+            vectors=SimpleNamespace(size=1536, distance="Cosine"),
+        )))
+
     def get_collections(self):
         return _CollectionsResponse([])
 
@@ -33,7 +40,8 @@ class VectorStoreTests(unittest.TestCase):
         store = VectorStore()
 
         with patch.object(store, "_get_client", return_value=_RacingClient()):
-            store.ensure_collection()
+            contract = store.ensure_collection()
+        self.assertEqual(contract.dimensions, 1536)
 
 
 if __name__ == "__main__":

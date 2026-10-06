@@ -1,0 +1,39 @@
+# Root-context build. Keep the cached Python packages and Playwright browsers.
+ARG RUNTIME_IMAGE=georank-deps-crawler:20261006-d8d7b319d7f4
+FROM ${RUNTIME_IMAGE}
+
+ARG RUNTIME_IMAGE
+ARG RUNTIME_IMAGE_ID=sha256:d8d7b319d7f4999886af8d91984eccf383b2ebc7b9dbdd1ecfabe0764a70a65a
+ARG SOURCE_REPOSITORY=https://github.com/he1016060110/GEORank
+ARG SOURCE_REVISION
+ARG RUNTIME_DEPENDENCIES_SHA256
+
+RUN test -n "$SOURCE_REPOSITORY" \
+    && test "${#SOURCE_REVISION}" -eq 40 \
+    && case "$SOURCE_REVISION" in *[!0-9a-f]*) exit 1 ;; esac \
+    && test "${#RUNTIME_DEPENDENCIES_SHA256}" -eq 64 \
+    && case "$RUNTIME_DEPENDENCIES_SHA256" in *[!0-9a-f]*) exit 1 ;; esac
+
+LABEL org.opencontainers.image.source="${SOURCE_REPOSITORY}" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      io.georank.build.runtime-image="${RUNTIME_IMAGE}" \
+      io.georank.build.runtime-image-id="${RUNTIME_IMAGE_ID}" \
+      org.yysensor.georank.runtime-dependencies.sha256="${RUNTIME_DEPENDENCIES_SHA256}" \
+      io.georank.build.runtime-mode="cached-dependencies-with-source-replacement" \
+      io.georank.build.source-policy="frozen-git-archive-required" \
+      io.georank.build.entrypoint-normalization="crlf-to-lf"
+
+WORKDIR /app
+
+# Python dependencies and browser binaries are outside /app. Old /app modules
+# must not survive when a file was deleted or renamed in the fork.
+RUN python -c "from pathlib import Path; import shutil, site; root = Path('/app'); assert all(not Path(p).resolve().is_relative_to(root) for p in site.getsitepackages()), 'Cannot replace an application-local dependency runtime'; [shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink() for p in root.iterdir()]; (root / 'runtime').mkdir()"
+COPY backend/ /app/
+# This is the frozen SOURCE dependency-contract hash, not an installation claim.
+RUN python -c "from pathlib import Path; import hashlib, sys; assert hashlib.sha256(Path('/app/requirements.txt').read_bytes()).hexdigest() == sys.argv[1], 'Source requirements digest differs from release manifest'" "$RUNTIME_DEPENDENCIES_SHA256"
+COPY --chmod=0755 backend/docker-entrypoint.sh /usr/local/bin/georank-entrypoint
+RUN python -c "from pathlib import Path; paths = (Path('/app/docker-entrypoint.sh'), Path('/usr/local/bin/georank-entrypoint')); [(p.write_bytes(p.read_bytes().replace(b'\r\n', b'\n')), p.chmod(0o755)) for p in paths]" \
+    && python -m compileall -q /app/app
+
+ENTRYPOINT ["/usr/local/bin/georank-entrypoint"]
+CMD ["celery", "-A", "app.core.celery_app", "worker", "-l", "info", "-c", "2", "-Q", "crawl", "--hostname=crawler@%h"]

@@ -1,11 +1,15 @@
+# Fork modification (he1016060110, 2026-10-06): verified company extraction and local embedding pipeline.
 """
 公司 API — 提交 / 列表 / 详情 / 投票 / 进度 / 相似推荐
 """
+import asyncio
+import hashlib
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import select, func, update
+from sqlalchemy import select, func, update, text
 from sqlalchemy.exc import IntegrityError
 
 from app.core.deps import DbSession, CurrentUser, OptionalUser
@@ -22,107 +26,148 @@ from app.schemas.company import (
 
 router = APIRouter()
 
+PUBLIC_ACTIVE_PIPELINE_STATUSES = {
+    PipelineStatus.PENDING, PipelineStatus.CRAWLING, PipelineStatus.CLEANING,
+    PipelineStatus.GRAPH_BUILDING, PipelineStatus.VECTORIZING,
+}
+PUBLIC_DISPATCH_TIMEOUT_SECONDS = 8.0
+
+
+def _public_dispatch_time() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _public_dispatch_metadata(company) -> dict:
+    details = company.geo_details if isinstance(company.geo_details, dict) else {}
+    dispatch = details.get("pipeline_dispatch")
+    return dispatch if isinstance(dispatch, dict) else {}
+
+
+def _public_url_lock_key(url: str) -> int:
+    # Transaction-scoped Postgres lock also serializes the absent-row/create case.
+    # Stable signed bigint; no process-local hash or database schema migration.
+    return int.from_bytes(hashlib.sha256(("georank-company-submit:" + url).encode("utf-8")).digest()[:8], "big", signed=True)
+
+
+async def _record_public_pipeline_dispatch(db: DbSession, company_id, task_id: str, dispatch_state: str) -> None:
+    """Reread under row lock so a late broker receipt cannot erase worker progress."""
+    result = await db.execute(
+        select(Company).where(Company.id == company_id).with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    company = result.scalar_one_or_none()
+    if not company:
+        await db.rollback()
+        return
+    details = dict(company.geo_details) if isinstance(company.geo_details, dict) else {}
+    dispatch = dict(_public_dispatch_metadata(company))
+    if dispatch.get("task_id") != task_id:
+        await db.rollback()
+        return
+    dispatch.update(state=dispatch_state, receipt_updated_at=_public_dispatch_time())
+    details["pipeline_dispatch"] = dispatch
+    values = {"geo_details": details}
+    if dispatch_state == "unknown" and company.pipeline_status == PipelineStatus.PENDING:
+        values["pipeline_error"] = "任务派发结果尚未确认，请观察当前任务状态，不要重复发起分析。"
+    await db.execute(update(Company).where(Company.id == company_id).values(**values))
+    await db.commit()
+
+
+async def _dispatch_public_company(db: DbSession, company_id, company_url: str, task_id: str) -> str:
+    try:
+        from app.core.celery_app import celery_app
+        await asyncio.wait_for(asyncio.to_thread(
+            celery_app.send_task, "app.tasks.crawl.crawl_company_website",
+            args=[str(company_id), company_url], task_id=task_id, retry=False,
+        ), timeout=PUBLIC_DISPATCH_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        # Cancelling a wait does not cancel the publishing thread or prove non-dispatch.
+        await asyncio.shield(_record_public_pipeline_dispatch(db, company_id, task_id, "unknown"))
+        raise
+    except Exception:
+        await _record_public_pipeline_dispatch(db, company_id, task_id, "unknown")
+        return "unknown"
+    await _record_public_pipeline_dispatch(db, company_id, task_id, "submitted")
+    return "submitted"
+
+
 @router.post("/submit", response_model=SubmitCompanyResponse, status_code=status.HTTP_202_ACCEPTED)
 async def submit_company(data: SubmitCompanyRequest, db: DbSession, current_user: OptionalUser):
-    """
-    用户提交公司 URL → 创建记录 → 触发 AI 入库流水线
-    返回 company_id，前端可轮询 pipeline-status
-    """
+    """Admit at most one company run; uncertain broker outcomes are observe-only."""
     try:
         normalized_url = normalize_company_url(data.url)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
-    # 检查是否已存在
-    result = await db.execute(select(Company).where(Company.url == normalized_url))
+    # Row locks alone cannot protect a URL whose company has not been created yet.
+    await db.execute(text("SELECT pg_advisory_xact_lock(:lock_key)"), {
+        "lock_key": _public_url_lock_key(normalized_url),
+    })
+    result = await db.execute(
+        select(Company).where(Company.url == normalized_url).with_for_update()
+        .execution_options(populate_existing=True)
+    )
     existing = result.scalar_one_or_none()
     if existing:
+        company_id = existing.id
+        publication = existing.publish_status.value
         if existing.publish_status == PublishStatus.PUBLISHED:
+            await db.rollback()
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"该 URL 已存在，company_id: {existing.id}",
+                detail=f"该 URL 已存在，company_id: {company_id}",
             )
-
-        should_restart = existing.pipeline_status == PipelineStatus.FAILED
-        if should_restart:
-            await resolve_async_ai_access(
-                db=db,
-                current_user=current_user,
-                module="companies",
-                prompt_text=normalized_url,
-            )
-            await db.execute(
-                update(Company)
-                .where(Company.id == existing.id)
-                .values(
-                    pipeline_status=PipelineStatus.PENDING,
-                    pipeline_error=None,
-                    crawl_candidates=[],
-                    crawl_pages=[],
-                    submitted_by=current_user.id if current_user else existing.submitted_by,
-                )
-            )
-            await db.commit()
-
-            try:
-                from app.core.celery_app import celery_app
-
-                celery_app.send_task(
-                    "app.tasks.crawl.crawl_company_website",
-                    args=[str(existing.id), normalized_url],
-                )
-            except Exception:
-                pass
-
+        dispatch = _public_dispatch_metadata(existing)
+        if (existing.pipeline_status in PUBLIC_ACTIVE_PIPELINE_STATUSES
+                or dispatch.get("state") in {"admitted", "pending", "unknown"}
+                or existing.pipeline_status != PipelineStatus.FAILED):
+            saved_status = existing.pipeline_status.value
+            await db.rollback()
+            unknown = dispatch.get("state") == "unknown"
             return SubmitCompanyResponse(
-                company_id=str(existing.id),
-                status="pending",
-                message="已重新加入处理队列",
-                normalized_url=normalized_url,
-                publish_status=existing.publish_status.value,
-                resumed=True,
+                company_id=str(company_id), status="dispatch_unknown" if unknown else saved_status,
+                message="派发回执尚未确认，只恢复同一任务观察，请勿重复创建。" if unknown
+                    else "已存在同域名分析任务，正在恢复分析进度。",
+                normalized_url=normalized_url, publish_status=publication, resumed=True,
+                task_id=dispatch.get("task_id"), dispatch_state=dispatch.get("state"), observe_only=True,
             )
 
-        return SubmitCompanyResponse(
-            company_id=str(existing.id),
-            status=existing.pipeline_status.value,
-            message="已存在同域名分析任务，正在恢复分析进度。",
-            normalized_url=normalized_url,
-            publish_status=existing.publish_status.value,
-            resumed=True,
-            )
+        await resolve_async_ai_access(db=db, current_user=current_user, module="companies", prompt_text=normalized_url)
+        task_id = str(uuid.uuid4())
+        details = dict(existing.geo_details) if isinstance(existing.geo_details, dict) else {}
+        if details.get("pipeline_quality"):
+            details["pipeline_previous_quality"] = details["pipeline_quality"]
+        details["pipeline_quality"] = None
+        details["pipeline_dispatch"] = {"task_id": task_id, "state": "pending", "admitted_at": _public_dispatch_time()}
+        await db.execute(update(Company).where(Company.id == company_id).values(
+            pipeline_status=PipelineStatus.PENDING, pipeline_error=None, geo_details=details,
+            submitted_by=current_user.id if current_user else existing.submitted_by,
+        ))
+        # Preserve saved source artifacts and scores; the new worker owns replacing its results.
+        await db.commit()
+        resumed = True
+    else:
+        await resolve_async_ai_access(db=db, current_user=current_user, module="companies", prompt_text=normalized_url)
+        task_id = str(uuid.uuid4())
+        company_id = uuid.uuid4()
+        publication = PublishStatus.DRAFT.value
+        company = Company(
+            id=company_id, name=normalized_url.split("//")[-1].split("/")[0], url=normalized_url,
+            pipeline_status=PipelineStatus.PENDING, publish_status=PublishStatus.DRAFT,
+            submitted_by=current_user.id if current_user else None,
+            geo_details={"pipeline_dispatch": {"task_id": task_id, "state": "pending", "admitted_at": _public_dispatch_time()}},
+        )
+        db.add(company)
+        await db.commit()
+        resumed = False
 
-    await resolve_async_ai_access(
-        db=db,
-        current_user=current_user,
-        module="companies",
-        prompt_text=normalized_url,
-    )
-
-    company = Company(
-        name=normalized_url.split("//")[-1].split("/")[0],  # 临时从 URL 提取域名作为名称
-        url=normalized_url,
-        pipeline_status=PipelineStatus.PENDING,
-        publish_status=PublishStatus.DRAFT,
-        submitted_by=current_user.id if current_user else None,
-    )
-    db.add(company)
-    await db.commit()
-    await db.refresh(company)
-
-    # 触发 Celery 爬取任务（如果 Celery 可用）
-    try:
-        from app.core.celery_app import celery_app
-        celery_app.send_task("app.tasks.crawl.crawl_company_website", args=[str(company.id), normalized_url])
-    except Exception:
-        pass  # 开发阶段 Celery 不可用时静默失败，流水线状态保持 pending
-
+    dispatch_state = await _dispatch_public_company(db, company_id, normalized_url, task_id)
     return SubmitCompanyResponse(
-        company_id=str(company.id),
-        status="pending",
-        message="已加入处理队列",
-        normalized_url=normalized_url,
-        publish_status=company.publish_status.value,
+        company_id=str(company_id), status="dispatch_unknown" if dispatch_state == "unknown" else "pending",
+        message="派发回执尚未确认，任务可能已进入队列；请观察同一任务，不要重试创建。" if dispatch_state == "unknown"
+            else "已重新加入处理队列" if resumed else "已加入处理队列",
+        normalized_url=normalized_url, publish_status=publication, resumed=resumed,
+        task_id=task_id, dispatch_state=dispatch_state, observe_only=True,
     )
 
 
@@ -263,6 +308,37 @@ async def upvote_company(company_id: str, db: DbSession, current_user: CurrentUs
     return VoteResponse(upvotes=upvotes)
 
 
+def _saved_pipeline_quality(company) -> dict | None:
+    """Return only the saved receipt; polling must never hydrate or call providers."""
+    details = company.geo_details if isinstance(company.geo_details, dict) else {}
+    quality = details.get("pipeline_quality")
+    return quality if isinstance(quality, dict) else None
+
+
+def _pipeline_stage_verified(name: str, stage) -> bool:
+    if not isinstance(stage, dict) or stage.get("status") not in {"complete", "passed"}:
+        return False
+    if name == "crawl":
+        return isinstance(stage.get("document_count"), (int, float)) and stage["document_count"] > 0
+    if stage.get("verified") is not True:
+        return False
+    if name == "clean":
+        return True
+    count_key = {"graph": "entity_count", "vector": "vector_count"}.get(name)
+    return bool(count_key and isinstance(stage.get(count_key), (int, float)) and stage[count_key] > 0)
+
+
+def _pipeline_quality_passed(quality: dict | None) -> bool:
+    if not quality or quality.get("status") not in {"complete", "passed"}:
+        return False
+    stages = quality.get("stages")
+    if not isinstance(stages, dict):
+        return False
+    return all(_pipeline_stage_verified(name, stages.get(name) or (
+        stages.get("profile") if name == "clean" else None
+    )) for name in ("crawl", "clean", "graph", "vector"))
+
+
 @router.get("/{company_id}/pipeline-status", response_model=PipelineStatusResponse)
 async def get_pipeline_status(company_id: str, db: DbSession):
     """查询入库流水线当前进度（前端轮询）"""
@@ -306,15 +382,47 @@ async def get_pipeline_status(company_id: str, db: DbSession):
         PipelineStatus.FAILED: company.pipeline_error or "本次知识库构建未成功完成。",
     }.get(company.pipeline_status)
 
+    quality = _saved_pipeline_quality(company)
+    quality_passed = _pipeline_quality_passed(quality) and not company.pipeline_error
+    progress = progress_map.get(company.pipeline_status, 0)
+    if company.pipeline_status == PipelineStatus.COMPLETED:
+        if not quality_passed:
+            progress = 0
+            stages = quality.get("stages", {}) if quality else {}
+            quality_failed = bool(company.pipeline_error) or bool(quality and (
+                quality.get("status") in {"failed", "degraded"}
+                or isinstance(stages, dict) and any(
+                    isinstance(stage, dict) and stage.get("status") in {"failed", "degraded"}
+                    for stage in stages.values()
+                )
+            ))
+            current_activity = (
+                company.pipeline_error or "企业知识库质量核验未通过，请在后台检查失败阶段。"
+                if quality_failed else "历史记录标为完成，但企业资料、图谱和向量成果尚无完整核验回执。"
+            )
+        elif company.publish_status == PublishStatus.PENDING_REVIEW:
+            current_activity = "企业资料、图谱和向量成果已核验，资料已提交后台审核。"
+        elif company.publish_status == PublishStatus.PUBLISHED:
+            current_activity = "企业知识库成果已核验，该公司已审核发布。"
+        else:
+            current_activity = "企业知识库成果已核验，当前仍为草稿，等待确认提交审核。"
+
+    dispatch = _public_dispatch_metadata(company)
+    if company.pipeline_status == PipelineStatus.PENDING and dispatch.get("state") == "unknown":
+        current_activity = "任务派发结果尚未确认，仅观察同一任务，不要重复提交或创建新任务。"
+
     return PipelineStatusResponse(
         company_id=str(company.id),
         status=company.pipeline_status.value,
-        progress=progress_map.get(company.pipeline_status, 0),
+        progress=progress,
         error=company.pipeline_error,
         current_activity=current_activity,
         publish_status=company.publish_status.value,
         company_name=company.name,
         company_summary=company.short_description,
+        company_url=company.url,
+        pipeline_quality=quality,
+        pipeline_dispatch=dispatch or None,
         selected_pages=crawl_pages,
     )
 
@@ -340,12 +448,17 @@ async def submit_company_for_review(company_id: str, db: DbSession, current_user
             detail="请等待分析完成后再提交审核。",
         )
 
-    if company_profile_needs_hydration(company):
-        await ensure_company_profile(db, company)
+    if company.pipeline_error or not _pipeline_quality_passed(_saved_pipeline_quality(company)):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="企业资料、图谱和向量成果尚未通过质量核验，请先重新分析。",
+        )
+
+    # Review is an explicit state transition, not an implicit paid hydration path.
     if company_profile_needs_hydration(company):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="企业资料尚未抽取完整，请稍后重试或重新运行分析。",
+            detail="企业资料尚未抽取完整，请重新运行分析。",
         )
 
     update_values = {

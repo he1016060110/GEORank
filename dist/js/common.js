@@ -1,3 +1,4 @@
+// Fork modification (he1016060110, 2026-10-06): same-origin API and verified company pipeline.
 /**
  * GEOrank - 公共 JavaScript
  * GEO 智搜优化引擎 前端系统
@@ -57,9 +58,7 @@
     };
 
     function apiBase() {
-        return ['80', '443', ''].includes(window.location.port)
-            ? ''
-            : `${window.location.protocol}//${window.location.hostname}:8000`;
+        return '';
     }
 
     // ===== 公开站点设置 =====
@@ -1158,9 +1157,7 @@ const FOOTER_HTML = `
         },
 
         get apiBase() {
-            return ['80', '443', ''].includes(window.location.port)
-                ? ''
-                : `${window.location.protocol}//${window.location.hostname}:8000`;
+            return '';
         },
 
         getCookie(name) {

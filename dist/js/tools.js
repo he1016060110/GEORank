@@ -1,3 +1,4 @@
+// Fork modification (he1016060110, 2026-10-06): same-origin API and verified company pipeline.
 /**
  * GEOrank - GEO 小工具频道
  * 用极简输入生成 JSON-LD、llms.txt、标题、知识库和 AI 友好度评分。
@@ -22,10 +23,7 @@
     };
 
     function apiBase() {
-        return window.GEOrank?.Auth?.apiBase
-            || (['80', '443', ''].includes(window.location.port)
-                ? ''
-                : `${window.location.protocol}//${window.location.hostname}:8000`);
+        return '';
     }
 
     function sleep(ms) {

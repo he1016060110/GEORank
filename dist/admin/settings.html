@@ -1,3 +1,4 @@
+<!-- Fork modification (he1016060110, 2026-10-06): self-hosted embedding and artifact verification UI. -->
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -136,17 +137,54 @@
                             <button type="button" id="llm-provider-save" class="btn btn-primary px-5 py-2.5 rounded-lg text-sm">保存 API 池</button>
                         </div>
                     </div>
+                    <section class="p-6 space-y-4" aria-labelledby="embedding-title">
+                        <div>
+                            <h3 id="embedding-title" class="text-sm font-bold mb-1">向量知识库（Embedding）</h3>
+                            <p class="text-xs text-on-surface-variant">独立于 DeepSeek 聊天与资料模型；保存配置不会调用模型，不会重建或删除已有集合。</p>
+                        </div>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label for="embedding-provider" class="block text-xs font-semibold mb-1.5">服务来源</label>
+                                <select id="embedding-provider" class="form-input">
+                                    <option value="local_tei">本机 TEI（免 Key）</option>
+                                    <option value="remote">远端 OpenAI 兼容服务</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label for="embedding-base-url" class="block text-xs font-semibold mb-1.5">Embedding Base URL</label>
+                                <input id="embedding-base-url" type="url" class="form-input" autocomplete="off" spellcheck="false" placeholder="读取服务器配置后显示">
+                            </div>
+                            <div>
+                                <label for="embedding-model" class="block text-xs font-semibold mb-1.5">真实模型名称</label>
+                                <input id="embedding-model" type="text" class="form-input" autocomplete="off" spellcheck="false">
+                            </div>
+                            <div>
+                                <label for="embedding-dimensions" class="block text-xs font-semibold mb-1.5">模型实际输出维度</label>
+                                <input id="embedding-dimensions" type="number" min="1" max="8192" step="1" class="form-input">
+                            </div>
+                            <div>
+                                <label for="embedding-collection" class="block text-xs font-semibold mb-1.5">模型隔离向量集合</label>
+                                <input id="embedding-collection" type="text" class="form-input" autocomplete="off" spellcheck="false">
+                            </div>
+                            <div>
+                                <label for="embedding-api-key" class="block text-xs font-semibold mb-1.5">远端服务 Key（本机无需填写）</label>
+                                <input id="embedding-api-key" type="password" class="form-input" autocomplete="new-password" spellcheck="false" placeholder="留空保留已有密钥，不回显">
+                                <p id="embedding-key-state" class="text-xs text-slate-500 mt-1.5">正在读取非敏感密钥状态…</p>
+                            </div>
+                        </div>
+                        <p id="embedding-local-note" class="text-xs text-slate-500">本机 intfloat/multilingual-e5-small 使用真实 384 维；新集合 companies_e5_small_v1 与旧 1536 维集合隔离，不能填充或伪造维度。</p>
+                        <div class="flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
+                            <p id="embedding-status" class="text-xs text-slate-500 break-words" role="status" aria-live="polite">正在读取服务器向量配置…</p>
+                            <div class="flex flex-wrap gap-2 flex-shrink-0">
+                                <button type="button" id="embedding-refresh" class="btn admin-btn-secondary px-4 py-2.5 rounded-lg text-sm">读取服务器状态</button>
+                                <button type="button" id="embedding-save" class="btn btn-primary px-4 py-2.5 rounded-lg text-sm" disabled>保存向量配置</button>
+                            </div>
+                        </div>
+                    </section>
                     <div class="p-6">
                         <h3 class="text-sm font-bold mb-1">其他 API 密钥</h3>
                         <p class="text-xs text-on-surface-variant mb-6">第三方服务集成密钥</p>
                         <div class="space-y-4">
-                            <div>
-                                <label class="block text-xs font-semibold text-on-surface-variant mb-1.5">OpenAI API Key（Embedding 专用）</label>
-                                <div class="flex gap-2">
-                                    <input id="setting-openai_api_key" type="text" autocomplete="off" spellcheck="false" data-secret-input="true" data-secret-masked="true" class="form-input admin-secret-input flex-1" placeholder="sk-...">
-                                    <button type="button" class="btn-toggle-key btn admin-btn-secondary px-3 py-2 rounded-lg text-xs">显示</button>
-                                </div>
-                            </div>
                             <div>
                                 <label class="block text-xs font-semibold text-on-surface-variant mb-1.5">Google Search API Key</label>
                                 <div class="flex gap-2">
@@ -369,6 +407,6 @@
             </main>
         </div>
     </div>
-    <script src="../js/admin.js?v=20260616-api-provider-list"></script>
+    <script src="../js/admin.js?v=20261006-embedding-quality"></script>
 </body>
 </html>

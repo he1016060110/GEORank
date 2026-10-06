@@ -1,12 +1,11 @@
+// Fork modification (he1016060110, 2026-10-06): same-origin API and verified company pipeline.
 /**
  * Diagnostic Page - 真实 GEO 诊断交互
  */
 (function () {
     'use strict';
 
-    const API_BASE = ['80', '443', ''].includes(window.location.port)
-        ? ''
-        : `${window.location.protocol}//${window.location.hostname}:8000`;
+    const API_BASE = '';
     const Routes = window.GEOrank?.Routes;
     const initialRouteState = Routes?.readDiagnosticState
         ? Routes.readDiagnosticState()

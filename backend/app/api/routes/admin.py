@@ -1,3 +1,4 @@
+# Fork modification (he1016060110, 2026-10-06): verified company extraction and local embedding pipeline.
 """
 后台管理 API — 公司审核 / 内容管理 / 用户管理 / 系统设置
 所有接口需要 admin 角色
@@ -12,7 +13,7 @@ import secrets
 import string
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.responses import HTMLResponse
@@ -47,9 +48,11 @@ from app.services.provider_url_security import (
     build_provider_http_client,
     provider_endpoint_identity,
     validate_provider_base_url,
+    validate_provider_url_shape,
 )
 from app.services.runtime_settings import (
     DEFAULT_HOMEPAGE_RELEASE_ID,
+    _build_ai_runtime_config,
     get_diagnostic_rule_config,
     get_ai_usage_policy_config,
     get_default_ai_usage_policy_config,
@@ -100,6 +103,8 @@ LLM_PROVIDER_KEYS_SETTING_KEY = "llm_provider_keys"
 GENERIC_SETTINGS_MANAGED_PROVIDER_KEYS = {
     LLM_PROVIDERS_SETTING_KEY,
     LLM_PROVIDER_KEYS_SETTING_KEY,
+    "embedding_provider",
+    "embedding_collection",
 }
 LEGACY_PROVIDER_URL_BINDINGS = (
     ("llm_base_url", "llm_api_key"),
@@ -278,6 +283,8 @@ PROTECTED_SETTING_KEYS = {
     "embedding_base_url",
     "embedding_model",
     "embedding_dimensions",
+    "embedding_provider",
+    "embedding_collection",
     "geo_auto_score",
     "geo_rescan_days",
     "geo_score_public",
@@ -707,6 +714,71 @@ def _company_admin_values(data: AdminCompanyRequest, *, partial: bool = False) -
     return values
 
 
+def _redact_pipeline_metadata(value: Any, *, depth: int = 0) -> Any:
+    """Bound saved receipt output and omit credential-bearing fields; never recompute it."""
+    if depth >= 8:
+        return None
+    if isinstance(value, dict):
+        return {
+            str(key): _redact_pipeline_metadata(item, depth=depth + 1)
+            for key, item in list(value.items())[:64]
+            if not is_sensitive_setting(str(key))
+            and str(key).strip().lower() not in {
+                "api_key", "authorization", "cookie", "headers", "password", "secret", "token",
+                "raw_request", "raw_response", "request_body", "response_body",
+            }
+        }
+    if isinstance(value, list):
+        return [_redact_pipeline_metadata(item, depth=depth + 1) for item in value[:64]]
+    if isinstance(value, str):
+        return value[:2048]
+    return value if value is None or isinstance(value, (bool, int, float)) else None
+
+
+def _company_pipeline_metadata(company, field: str) -> dict | None:
+    details = company.geo_details if isinstance(company.geo_details, dict) else {}
+    receipt = details.get(field)
+    return _redact_pipeline_metadata(receipt) if isinstance(receipt, dict) else None
+
+
+def _positive_artifact_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _company_publish_quality_issues(company) -> list[str]:
+    """Strict saved-facts gate. LLM extraction 'passed' is not pipeline 'complete'."""
+    issues = []
+    if company.pipeline_status != PipelineStatus.COMPLETED:
+        issues.append("pipeline_not_completed")
+    details = company.geo_details if isinstance(company.geo_details, dict) else {}
+    quality = details.get("pipeline_quality")
+    if not isinstance(quality, dict):
+        return issues + ["saved_pipeline_quality_missing"]
+    if quality.get("status") != "complete":
+        issues.append("pipeline_quality_not_complete")
+    if not isinstance(quality.get("run_id"), str) or not quality["run_id"].strip():
+        issues.append("pipeline_run_id_missing")
+    stages = quality.get("stages")
+    if not isinstance(stages, dict):
+        return issues + ["pipeline_stage_receipts_missing"]
+    for name in ("crawl", "clean", "graph", "vector"):
+        stage = stages.get(name)
+        if not isinstance(stage, dict) or stage.get("status") != "complete" or stage.get("verified") is not True:
+            issues.append(f"stage_{name}_not_verified")
+    for name, count_key in (("crawl", "document_count"), ("graph", "entity_count"), ("vector", "vector_count")):
+        stage = stages.get(name) if isinstance(stages.get(name), dict) else {}
+        count = quality.get(count_key)
+        if not _positive_artifact_count(count) or not _positive_artifact_count(stage.get(count_key)):
+            issues.append(f"{count_key}_missing_or_zero")
+        elif stage[count_key] != count:
+            issues.append(f"{count_key}_receipt_mismatch")
+    clean = stages.get("clean") if isinstance(stages.get("clean"), dict) else {}
+    extraction = clean.get("extraction_quality")
+    if not isinstance(extraction, dict) or extraction.get("source") != "llm" or extraction.get("status") != "passed":
+        issues.append("profile_extraction_not_verified")
+    return issues
+
+
 @router.get("/companies")
 async def list_companies_admin(
     db: DbSession,
@@ -767,6 +839,8 @@ async def list_companies_admin(
                 "is_geo_certified": c.is_geo_certified,
                 "pipeline_status": c.pipeline_status.value,
                 "pipeline_error": c.pipeline_error,
+                "pipeline_quality": _company_pipeline_metadata(c, "pipeline_quality"),
+                "pipeline_dispatch": _company_pipeline_metadata(c, "pipeline_dispatch"),
                 "publish_status": c.publish_status.value,
                 "geo_score": c.geo_score,
                 "upvotes": c.upvotes,
@@ -884,6 +958,8 @@ async def get_company_admin_detail(company_id: str, db: DbSession, _: AdminUser)
         "team_members": company.team_members or [],
         "geo_score": company.geo_score,
         "geo_details": company.geo_details or {},
+        "pipeline_quality": _company_pipeline_metadata(company, "pipeline_quality"),
+        "pipeline_dispatch": _company_pipeline_metadata(company, "pipeline_dispatch"),
         "pipeline_status": company.pipeline_status.value,
         "pipeline_error": company.pipeline_error,
         "publish_status": company.publish_status.value,
@@ -947,18 +1023,30 @@ async def update_company_admin(company_id: str, data: AdminCompanyRequest, db: D
 
 @router.post("/companies/{company_id}/approve")
 async def approve_company(company_id: str, db: DbSession, _: AdminUser):
-    """审核通过 → 发布"""
-    cid = uuid.UUID(company_id)
-    result = await db.execute(select(Company).where(Company.id == cid))
+    """Only publish a verified saved run. Approval never hydrates/calls a provider."""
+    try:
+        cid = uuid.UUID(company_id)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="公司 ID 不合法") from exc
+    result = await db.execute(
+        select(Company).where(Company.id == cid).with_for_update()
+        .execution_options(populate_existing=True)
+    )
     company = result.scalar_one_or_none()
     if not company:
+        await db.rollback()
         raise HTTPException(status_code=404, detail="公司不存在")
-
-    if company.pipeline_status == PipelineStatus.COMPLETED and company_profile_needs_hydration(company):
-        await ensure_company_profile(db, company)
+    issues = _company_publish_quality_issues(company)
+    if issues:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail={
+            "code": "COMPANY_PIPELINE_QUALITY_REQUIRED",
+            "message": "抓取、资料、图谱和向量尚未通过完整质量验收，暂不能审核发布。",
+            "issues": issues,
+        })
     if company_profile_needs_hydration(company):
-        raise HTTPException(status_code=409, detail="公司资料未抽取完整，暂不能发布")
-
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="公司资料未抽取完整，暂不能发布；审核操作不会自动调用模型补全")
     await db.execute(
         update(Company).where(Company.id == cid).values(publish_status=PublishStatus.PUBLISHED)
     )
@@ -980,39 +1068,114 @@ async def reject_company(company_id: str, db: DbSession, _: AdminUser, reason: s
     return {"status": "rejected", "company_id": company_id}
 
 
-@router.post("/companies/{company_id}/retry-pipeline")
-async def retry_pipeline(company_id: str, db: DbSession, admin_user: AdminUser):
-    """重新触发入库流水线"""
-    cid = uuid.UUID(company_id)
-    result = await db.execute(select(Company).where(Company.id == cid))
+ACTIVE_PIPELINE_STATUSES = {
+    PipelineStatus.PENDING, PipelineStatus.CRAWLING, PipelineStatus.CLEANING,
+    PipelineStatus.GRAPH_BUILDING, PipelineStatus.VECTORIZING,
+}
+PIPELINE_DISPATCH_TIMEOUT_SECONDS = 8.0
+
+
+async def _record_pipeline_dispatch(
+    db: DbSession, company_id: uuid.UUID, task_id: str, dispatch_state: str,
+) -> None:
+    """Merge the receipt into fresh metadata; never overwrite worker progress."""
+    result = await db.execute(
+        select(Company).where(Company.id == company_id).with_for_update()
+        .execution_options(populate_existing=True)
+    )
     company = result.scalar_one_or_none()
     if not company:
+        await db.rollback()
+        return
+    details = dict(company.geo_details or {})
+    dispatch = dict(details.get("pipeline_dispatch") or {})
+    if dispatch.get("task_id") != task_id:
+        await db.rollback()
+        return
+    dispatch.update(state=dispatch_state, receipt_updated_at=_utc_now().isoformat())
+    details["pipeline_dispatch"] = dispatch
+    values = {"geo_details": details}
+    if dispatch_state == "unknown" and company.pipeline_status == PipelineStatus.PENDING:
+        values["pipeline_error"] = "任务派发结果尚未确认，请观察当前任务状态，不要重复发起分析。"
+    await db.execute(update(Company).where(Company.id == company_id).values(**values))
+    await db.commit()
+
+
+@router.post("/companies/{company_id}/retry-pipeline")
+async def retry_pipeline(
+    company_id: str, db: DbSession, admin_user: AdminUser, response: Response,
+):
+    """Admit at most one active run for a company; uncertain dispatch is observe-only."""
+    try:
+        cid = uuid.UUID(company_id)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="公司 ID 不合法") from exc
+    # The admission state and task id are committed under the same database row lock.
+    result = await db.execute(
+        select(Company).where(Company.id == cid).with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    company = result.scalar_one_or_none()
+    if not company:
+        await db.rollback()
         raise HTTPException(status_code=404, detail="公司不存在")
+    if company.pipeline_status in ACTIVE_PIPELINE_STATUSES:
+        dispatch = (company.geo_details or {}).get("pipeline_dispatch") or {}
+        active_status = company.pipeline_status.value
+        await db.rollback()
+        raise HTTPException(status_code=409, detail={
+            "code": "COMPANY_PIPELINE_IN_FLIGHT",
+            "message": "该公司已有进行中或派发结果待确认的分析，请刷新观察，勿重复发起。",
+            "company_id": company_id,
+            "pipeline_status": active_status,
+            "task_id": dispatch.get("task_id"),
+            "dispatch_state": dispatch.get("state", "unknown"),
+            "observe_only": True,
+        })
 
     usage_user = await _load_user_for_usage(db, company.submitted_by) or admin_user
     await resolve_async_ai_access(
-        db=db,
-        current_user=usage_user,
-        module="companies",
-        prompt_text=company.url,
+        db=db, current_user=usage_user, module="companies", prompt_text=company.url,
     )
-
-    await db.execute(
-        update(Company).where(Company.id == cid).values(
-            pipeline_status=PipelineStatus.PENDING,
-            pipeline_error=None,
-            submitted_by=usage_user.id,
-        )
-    )
+    task_id = str(uuid.uuid4())
+    company_url = company.url
+    details = dict(company.geo_details or {})
+    previous_quality = details.get("pipeline_quality")
+    if previous_quality:
+        details["pipeline_previous_quality"] = previous_quality
+    details["pipeline_quality"] = None
+    details["pipeline_dispatch"] = {
+        "task_id": task_id, "state": "admitted", "admitted_at": _utc_now().isoformat(),
+    }
+    await db.execute(update(Company).where(Company.id == cid).values(
+        pipeline_status=PipelineStatus.PENDING, pipeline_error=None,
+        submitted_by=usage_user.id, geo_details=details,
+    ))
     await db.commit()
-
     try:
         from app.core.celery_app import celery_app
-        celery_app.send_task("app.tasks.crawl.crawl_company_website", args=[company_id, company.url])
+        # No broker auto-retry: an ambiguous publish may already have reached the worker.
+        await asyncio.wait_for(asyncio.to_thread(
+            celery_app.send_task, "app.tasks.crawl.crawl_company_website",
+            args=[company_id, company_url], task_id=task_id, retry=False,
+        ), timeout=PIPELINE_DISPATCH_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        # The original dispatch thread may still publish after the caller disconnects.
+        await asyncio.shield(_record_pipeline_dispatch(db, cid, task_id, "unknown"))
+        raise
     except Exception:
-        pass
-
-    return {"status": "retrying", "company_id": company_id}
+        await _record_pipeline_dispatch(db, cid, task_id, "unknown")
+        response.status_code = status.HTTP_202_ACCEPTED
+        return {
+            "status": "dispatch_unknown", "company_id": company_id, "task_id": task_id,
+            "dispatch_state": "unknown", "observe_only": True,
+            "message": "派发回执尚未确认，任务可能已进入队列；请观察，不要重试创建。",
+        }
+    await _record_pipeline_dispatch(db, cid, task_id, "submitted")
+    return {
+        "status": "retrying", "company_id": company_id, "task_id": task_id,
+        "dispatch_state": "submitted", "observe_only": True,
+    }
 
 
 @router.delete("/companies/{company_id}")
@@ -3828,6 +3991,120 @@ def _normalize_admin_entry_path(value) -> str:
         )
     return f"/{segment}"
 
+EMBEDDING_SETTING_FIELDS = {
+    "provider": "embedding_provider", "base_url": "embedding_base_url",
+    "model": "embedding_model", "dimensions": "embedding_dimensions",
+    "collection": "embedding_collection",
+}
+LOCAL_TEI_BASE_URL = "http://host.docker.internal:45310/v1"
+LOCAL_TEI_MODEL = "intfloat/multilingual-e5-small"
+LOCAL_TEI_COLLECTION = "companies_e5_small_v1"
+
+
+class EmbeddingSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    provider: Literal["remote", "local_tei"]
+    base_url: str = Field(min_length=3, max_length=500)
+    model: str = Field(min_length=1, max_length=160)
+    dimensions: int = Field(ge=1, le=8192, strict=True)
+    collection: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,95}$")
+    # Omitted, empty, or masked keys preserve the existing secret. Deletion is not implicit.
+    api_key: str | None = Field(default=None, max_length=4096)
+
+
+def _normalize_embedding_payload(request: EmbeddingSettingsRequest) -> dict[str, Any]:
+    payload = request.model_dump()
+    for field in ("base_url", "model"):
+        payload[field] = payload[field].strip().rstrip("/") if field == "base_url" else payload[field].strip()
+    if not payload["model"] or any(ord(c) < 32 for c in payload["model"]):
+        raise HTTPException(status_code=400, detail="Embedding 模型名不合法")
+    if request.provider == "local_tei":
+        if (
+            payload["base_url"] != LOCAL_TEI_BASE_URL
+            or payload["model"] != LOCAL_TEI_MODEL
+            or payload["dimensions"] != 384
+            or payload["collection"] != LOCAL_TEI_COLLECTION
+        ):
+            raise HTTPException(status_code=400, detail="本地 TEI 必须使用已核验的专用端点、模型、384 维和独立向量集合")
+    else:
+        try:
+            payload["base_url"] = validate_provider_url_shape(payload["base_url"])
+        except ProviderURLValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return payload
+
+
+async def _load_admin_embedding_config(db: DbSession) -> dict[str, Any]:
+    keys = {*EMBEDDING_SETTING_FIELDS.values(), "embedding_api_key", "openai_api_key"}
+    result = await db.execute(select(Setting).where(Setting.key.in_(keys)))
+    values = {
+        item.key: decrypt_setting_value(item.value, item.key, item.category)
+        for item in result.scalars().all()
+    }
+    return _build_ai_runtime_config(values)
+
+
+def _serialize_embedding_config(config: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        field: config.get(key) for field, key in EMBEDDING_SETTING_FIELDS.items()
+    }
+    result["has_api_key"] = bool(config.get("embedding_api_key"))
+    issues = []
+    try:
+        _normalize_embedding_payload(EmbeddingSettingsRequest(**{
+            field: value for field, value in result.items() if field != "has_api_key"
+        }))
+    except Exception:
+        issues.append("Embedding 配置不完整或不符合已核验的端点/维度要求")
+    if result["provider"] == "remote" and not result["has_api_key"]:
+        issues.append("远端 Embedding 专用 API Key 未配置；聊天 Key 不会自动复用")
+    result["readiness"] = {
+        "state": "blocked" if issues else "configured",
+        "configured": not issues, "issues": issues,
+        "verification": "configuration_only", "connected": None,
+        "collection_verified": False,
+    }
+    result["cache_ttl_seconds"] = 5
+    return result
+
+
+@router.get("/settings/embedding")
+async def get_embedding_settings_admin(db: DbSession, _: AdminUser):
+    """Read redacted configuration only; no provider call or collection creation."""
+    return _serialize_embedding_config(await _load_admin_embedding_config(db))
+
+
+@router.put("/settings/embedding")
+async def update_embedding_settings_admin(
+    request: EmbeddingSettingsRequest, db: DbSession, admin: AdminUser,
+):
+    """Persist only. Local TEI never receives a remote secret; other API settings are untouched."""
+    payload = _normalize_embedding_payload(request)
+    current = await _load_admin_embedding_config(db)
+    raw_key = (payload.get("api_key") or "").strip()
+    new_key = raw_key if raw_key and not _is_masked_secret(raw_key) else None
+    if payload["provider"] == "remote":
+        if current.get("embedding_api_key") and (
+            provider_endpoint_identity(payload["base_url"])
+            != provider_endpoint_identity(str(current.get("embedding_base_url") or ""))
+        ) and not new_key:
+            raise HTTPException(status_code=400, detail="更换远端 Embedding 端点时必须显式提供新的专用 API Key")
+        if not (new_key or current.get("embedding_api_key")):
+            raise HTTPException(status_code=400, detail="远端 Embedding 需要专用 API Key")
+    for field, key in EMBEDDING_SETTING_FIELDS.items():
+        await _store_setting_value(db, admin, key, payload[field], category="llm")
+    if new_key:
+        await _store_setting_value(db, admin, "embedding_api_key", new_key, category="api_keys")
+    await db.commit()
+    await invalidate_runtime_settings_cache()
+    # Workers compare runtime fingerprints on their next read (cache bounded to five seconds).
+    updated = dict(current)
+    updated.update({key: payload[field] for field, key in EMBEDDING_SETTING_FIELDS.items()})
+    if new_key:
+        updated["embedding_api_key"] = new_key
+    return {"status": "saved", **_serialize_embedding_config(updated)}
+
+
 @router.get("/settings")
 async def get_settings(db: DbSession, _: AdminUser):
     """获取全量系统设置（API key 脱敏）"""
@@ -3857,7 +4134,7 @@ async def update_settings(request: dict, db: DbSession, admin: AdminUser):
     if managed_keys:
         raise HTTPException(
             status_code=400,
-            detail="多 Provider 配置必须通过专用 API 管理",
+            detail="Provider/Embedding 配置必须通过专用 API 管理",
         )
 
     homepage_root_path = None

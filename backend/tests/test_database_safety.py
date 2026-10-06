@@ -159,6 +159,8 @@ from app.core.database import engine
 assert settings.POSTGRES_DB == 'project_ci_42'
 assert settings.DATABASE_URL.endswith('/project_ci_42')
 assert engine.url.database == 'project_ci_42'
+from sqlalchemy.pool import NullPool
+assert isinstance(engine.pool, NullPool)
 """
 
         completed = subprocess.run(
@@ -188,6 +190,10 @@ from app.core.database import engine
 assert settings.POSTGRES_DB == 'georank_production'
 assert settings.DATABASE_URL.endswith('/georank_production')
 assert engine.url.database == 'georank_production'
+from sqlalchemy.pool import AsyncAdaptedQueuePool
+assert isinstance(engine.pool, AsyncAdaptedQueuePool)
+assert engine.pool.size() == 20
+assert engine.pool._max_overflow == 10
 """
 
         completed = subprocess.run(
@@ -250,6 +256,8 @@ except RuntimeError:
 import test_api_integration
 from app.core.database import engine
 assert engine.url.database == 'project_ci_42'
+from sqlalchemy.pool import NullPool
+assert isinstance(engine.pool, NullPool)
 """
 
         completed = subprocess.run(
@@ -298,6 +306,79 @@ else:
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
+
+
+class DatabaseEnginePoolingTests(unittest.TestCase):
+    """Pooling checks are pure configuration tests: no database connections."""
+
+    def _options(self, database_name: str, environment: dict) -> dict:
+        from app.core.database import _engine_options
+        return _engine_options(
+            f"postgresql+asyncpg://user:pass@127.0.0.1:5432/{database_name}",
+            environment,
+        )
+
+    def test_explicit_isolated_database_uses_null_pool(self) -> None:
+        from sqlalchemy.pool import NullPool
+        for database_name in ("georank_pipeline_repair_20261006_test", "project_ci_42"):
+            with self.subTest(database_name=database_name):
+                self.assertEqual(
+                    self._options(database_name, {"POSTGRES_DB": database_name}),
+                    {"poolclass": NullPool, "pool_pre_ping": True},
+                )
+
+    def test_only_matching_bootstrapped_test_url_uses_null_pool(self) -> None:
+        from sqlalchemy.pool import NullPool
+        environment = {
+            "TEST_DATABASE_URL": "postgresql://user:pass@127.0.0.1/project_ci_42",
+        }
+        bootstrap_test_database_environment(environment)
+        self.assertIs(self._options("project_ci_42", environment)["poolclass"], NullPool)
+
+    def test_production_databases_always_keep_original_pool(self) -> None:
+        expected = {
+            "pool_size": 20, "max_overflow": 10,
+            "pool_recycle": 3600, "pool_pre_ping": True,
+        }
+        for database_name in ("georank", "georank_prod", "postgres", "template0", "template1"):
+            with self.subTest(database_name=database_name):
+                self.assertEqual(
+                    self._options(database_name, {"POSTGRES_DB": database_name}), expected
+                )
+
+    def test_implicit_dotenv_test_name_does_not_change_pool(self) -> None:
+        self.assertEqual(self._options("project_ci_42", {})["pool_size"], 20)
+
+    def test_substring_without_distinct_test_marker_does_not_change_pool(self) -> None:
+        for database_name in ("contest", "testimonials", "civil_production"):
+            with self.subTest(database_name=database_name):
+                self.assertEqual(
+                    self._options(database_name, {"POSTGRES_DB": database_name})["pool_size"], 20
+                )
+
+    def test_mismatching_explicit_database_does_not_change_pool(self) -> None:
+        self.assertEqual(
+            self._options("project_ci_42", {"POSTGRES_DB": "different_test"})["pool_size"], 20
+        )
+
+    def test_unbootstrapped_test_url_does_not_change_app_database_pool(self) -> None:
+        self.assertEqual(self._options("project_ci_42", {
+            "TEST_DATABASE_URL": "postgresql://user:pass@127.0.0.1/project_ci_42",
+        })["pool_size"], 20)
+
+    def test_mismatching_or_invalid_test_url_does_not_change_pool(self) -> None:
+        for test_url in (
+            "not-a-database-url",
+            "postgresql://user:pass@127.0.0.1/georank",
+            "postgresql://user:pass@different-host/project_ci_42",
+            "postgresql://user:other@127.0.0.1/project_ci_42",
+            "postgresql://user@127.0.0.1/project_ci_42",
+            "postgresql://user:pass@127.0.0.1/project_ci_42?x=1",
+        ):
+            with self.subTest(test_url=test_url):
+                self.assertEqual(self._options("project_ci_42", {
+                    "POSTGRES_DB": "project_ci_42", "TEST_DATABASE_URL": test_url,
+                })["pool_size"], 20)
 
 
 if __name__ == "__main__":

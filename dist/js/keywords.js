@@ -1,3 +1,4 @@
+// Fork modification (he1016060110, 2026-10-06): same-origin API and verified company pipeline.
 /**
  * GEOrank - 拓词工具 JavaScript
  * 调用后端 AI API 生成 8 维拓词结果
@@ -5,9 +6,7 @@
 (function () {
     'use strict';
 
-    const API_BASE = ['80', '443', ''].includes(window.location.port)
-        ? ''
-        : `${window.location.protocol}//${window.location.hostname}:8000`;
+    const API_BASE = '';
     const Auth = window.GEOrank?.Auth;
     const PREVIEW_COUNT = 8;
     const SAMPLE_PAYLOAD = {

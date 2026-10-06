@@ -1,3 +1,4 @@
+# Fork modification (he1016060110, 2026-10-06): verified company extraction and local embedding pipeline.
 """
 运行时设置解析。
 
@@ -20,7 +21,8 @@ from app.models.settings import Setting
 from app.services.settings_security import decrypt_setting_value
 
 _cache_lock = asyncio.Lock()
-_cache_ttl_seconds = 15
+# Other processes (Celery workers) refresh without sharing an in-memory cache.
+_cache_ttl_seconds = 5
 _cache_expires_at = 0.0
 _settings_cache: dict[str, Any] = {}
 DEFAULT_DIAGNOSTIC_RULE_WEIGHTS = {
@@ -426,6 +428,10 @@ def _build_ai_runtime_config(values: dict[str, Any]) -> dict[str, Any]:
             values.get("codex_model"),
             settings.LLM_FALLBACK_MODEL,
             settings.CODEX_MODEL,
+        ),
+        "embedding_provider": _pick_string(values.get("embedding_provider"), "remote"),
+        "embedding_collection": _pick_string(
+            values.get("embedding_collection"), settings.QDRANT_COLLECTION,
         ),
         "embedding_api_key": _pick_string(
             values.get("embedding_api_key"),
