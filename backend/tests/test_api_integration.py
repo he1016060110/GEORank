@@ -61,6 +61,46 @@ _TEST_LOOP = asyncio.new_event_loop()
 asyncio.set_event_loop(_TEST_LOOP)
 
 
+def _verified_company_pipeline_fixture_quality(source_url: str) -> dict:
+    """Synthetic saved-receipt fixture, never a claim about customer artifacts."""
+    source_id = "codex-it-source-verified-fixture"
+    return {
+        "status": "complete",
+        "run_id": "codex-it-verified-fixture-run",
+        "document_count": 1,
+        "entity_count": 2,
+        "relationship_count": 1,
+        "vector_count": 1,
+        "sources": [{
+            "source_id": source_id,
+            "url": source_url,
+            "html_sha256": "a" * 64,
+        }],
+        "stages": {
+            "crawl": {
+                "status": "complete", "verified": True, "document_count": 1,
+                "source_ids": [source_id],
+            },
+            "clean": {
+                "status": "complete", "verified": True,
+                "extraction_quality": {
+                    "source": "llm", "status": "passed", "source_ids": [source_id],
+                },
+            },
+            "graph": {
+                "status": "complete", "verified": True, "entity_count": 2,
+                "relationship_count": 1, "source_ids": [source_id],
+                "graph_version": "codex-it-verified-fixture-graph",
+            },
+            "vector": {
+                "status": "complete", "verified": True, "vector_count": 1,
+                "dimensions": 384, "source_ids": [source_id],
+                "collection": "codex_it_verified_fixture_vectors",
+            },
+        },
+    }
+
+
 class ApiIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1615,19 +1655,32 @@ class ApiIntegrationTests(unittest.TestCase):
                         tags=["GEO优化"],
                         tech_stack=["OpenAI API"],
                         geo_score=66,
-                        geo_details={"schema": 60, "content": 70, "meta": 65, "citation": 68},
+                        geo_details={
+                            "schema": 60, "content": 70, "meta": 65, "citation": 68,
+                            "pipeline_quality": _verified_company_pipeline_fixture_quality(company_url),
+                        },
                     )
                 )
                 await db.commit()
 
         self.run_async(_mark_completed())
 
-        final_submit = self.run_async(
-            self.client.post(
-                f"/api/companies/{company_id}/submit-review",
-                headers=self._auth_headers(user["token"]),
+        with patch(
+            "app.api.routes.companies.ensure_company_profile", new_callable=AsyncMock,
+        ) as hydrate, patch(
+            "app.services.company_profile.ai_client.extract_company_info", new_callable=AsyncMock,
+        ) as extract, patch(
+            "app.services.company_profile.ai_client._raw_chat_complete", new_callable=AsyncMock,
+        ) as provider:
+            final_submit = self.run_async(
+                self.client.post(
+                    f"/api/companies/{company_id}/submit-review",
+                    headers=self._auth_headers(user["token"]),
+                )
             )
-        )
+        hydrate.assert_not_called()
+        extract.assert_not_called()
+        provider.assert_not_called()
         self.assertEqual(final_submit.status_code, 200, final_submit.text)
         self.assertEqual(final_submit.json()["status"], "pending_review")
 
@@ -1640,26 +1693,14 @@ class ApiIntegrationTests(unittest.TestCase):
         self.assertEqual(company.publish_status, PublishStatus.PENDING_REVIEW)
         self.assertIsNotNone(company.submitted_by)
 
-    def test_submit_company_review_auto_hydrates_missing_profile(self):
+    def test_submit_company_review_rejects_without_source_receipt(self):
         user = self.run_async(self._register_user())
         company_url = f"{TEST_COMPANY_URL_PREFIX}{uuid.uuid4().hex[:10]}.review.test"
-        html = """
-        <html>
-          <head>
-            <title>移山科技官网</title>
-            <meta name=\"description\" content=\"中国领先的 GEO 优化服务商\" />
-          </head>
-          <body>
-            <h1>移山科技</h1>
-            <p>提供 GEO 诊断与 AI 搜索优化方案。</p>
-          </body>
-        </html>
-        """.encode("utf-8")
 
         async def _create_company():
             async with async_session() as db:
                 company = Company(
-                    name="www.geokeji.com",
+                    name="missing-profile.example.invalid",
                     url=company_url,
                     pipeline_status=PipelineStatus.COMPLETED,
                     publish_status=PublishStatus.DRAFT,
@@ -1672,20 +1713,13 @@ class ApiIntegrationTests(unittest.TestCase):
 
         company_id = self.run_async(_create_company())
 
-        with patch("app.services.company_profile.storage.get", return_value=html), patch(
-            "app.services.company_profile.ai_client.extract_company_info",
-            new=AsyncMock(
-                return_value={
-                    "name": "移山科技",
-                    "description": "移山科技专注 GEO 优化与 AI 搜索可见度提升。",
-                    "short_description": "中国领先的 GEO 优化服务商。",
-                    "category": "GEO咨询",
-                    "tags": ["GEO优化", "AI搜索"],
-                    "tech_stack": ["OpenAI API", "Firecrawl"],
-                    "team_members": [{"name": "张三", "role": "创始人"}],
-                }
-            ),
-        ):
+        with patch(
+            "app.api.routes.companies.ensure_company_profile", new_callable=AsyncMock,
+        ) as hydrate, patch(
+            "app.services.company_profile.ai_client.extract_company_info", new_callable=AsyncMock,
+        ) as extract, patch(
+            "app.services.company_profile.ai_client._raw_chat_complete", new_callable=AsyncMock,
+        ) as provider, patch("app.services.company_profile.storage.get") as storage_get:
             final_submit = self.run_async(
                 self.client.post(
                     f"/api/companies/{company_id}/submit-review",
@@ -1693,7 +1727,11 @@ class ApiIntegrationTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(final_submit.status_code, 200, final_submit.text)
+        self.assertEqual(final_submit.status_code, 409, final_submit.text)
+        hydrate.assert_not_called()
+        extract.assert_not_called()
+        provider.assert_not_called()
+        storage_get.assert_not_called()
 
         async def _fetch_company():
             async with async_session() as db:
@@ -1701,37 +1739,26 @@ class ApiIntegrationTests(unittest.TestCase):
                 return result.scalar_one()
 
         company = self.run_async(_fetch_company())
-        self.assertEqual(company.publish_status, PublishStatus.PENDING_REVIEW)
-        self.assertEqual(company.name, "移山科技")
-        self.assertEqual(company.category, "GEO咨询")
-        self.assertTrue(company.short_description)
-        self.assertTrue(company.description)
-        self.assertIn("GEO优化", company.tags or [])
-        self.assertIn("OpenAI API", company.tech_stack or [])
-        self.assertEqual((company.team_members or [{}])[0].get("name"), "张三")
-        self.assertIsNotNone(company.geo_score)
-        self.assertIsNotNone(company.geo_details)
+        self.assertEqual(company.publish_status, PublishStatus.DRAFT)
+        self.assertEqual(company.pipeline_status, PipelineStatus.COMPLETED)
+        self.assertEqual(company.name, "missing-profile.example.invalid")
+        self.assertFalse(company.short_description)
+        self.assertFalse(company.description)
+        self.assertFalse(company.tags)
+        self.assertFalse(company.tech_stack)
+        self.assertFalse(company.team_members)
+        self.assertIsNone(company.geo_score)
+        self.assertIsNone(company.geo_details)
+        self.assertIsNone(company.submitted_by)
 
-    def test_admin_approve_company_auto_hydrates_missing_profile(self):
+    def test_admin_approve_company_rejects_without_source_receipt(self):
         admin = self.run_async(self._register_user(admin=True))
         company_url = f"{TEST_COMPANY_URL_PREFIX}{uuid.uuid4().hex[:10]}.review.test"
-        html = """
-        <html>
-          <head>
-            <title>移山科技官网</title>
-            <meta name=\"description\" content=\"中国领先的 GEO 优化服务商\" />
-          </head>
-          <body>
-            <h1>移山科技</h1>
-            <p>提供 GEO 诊断与 AI 搜索优化方案。</p>
-          </body>
-        </html>
-        """.encode("utf-8")
 
         async def _create_company():
             async with async_session() as db:
                 company = Company(
-                    name="www.geokeji.com",
+                    name="missing-profile.example.invalid",
                     url=company_url,
                     pipeline_status=PipelineStatus.COMPLETED,
                     publish_status=PublishStatus.PENDING_REVIEW,
@@ -1744,20 +1771,13 @@ class ApiIntegrationTests(unittest.TestCase):
 
         company_id = self.run_async(_create_company())
 
-        with patch("app.services.company_profile.storage.get", return_value=html), patch(
-            "app.services.company_profile.ai_client.extract_company_info",
-            new=AsyncMock(
-                return_value={
-                    "name": "移山科技",
-                    "description": "移山科技专注 GEO 优化与 AI 搜索可见度提升。",
-                    "short_description": "中国领先的 GEO 优化服务商。",
-                    "category": "GEO咨询",
-                    "tags": ["GEO优化", "AI搜索"],
-                    "tech_stack": ["OpenAI API", "Firecrawl"],
-                    "team_members": [{"name": "张三", "role": "创始人"}],
-                }
-            ),
-        ):
+        with patch(
+            "app.api.routes.admin.ensure_company_profile", new_callable=AsyncMock,
+        ) as hydrate, patch(
+            "app.services.company_profile.ai_client.extract_company_info", new_callable=AsyncMock,
+        ) as extract, patch(
+            "app.services.company_profile.ai_client._raw_chat_complete", new_callable=AsyncMock,
+        ) as provider, patch("app.services.company_profile.storage.get") as storage_get:
             approve_response = self.run_async(
                 self.client.post(
                     f"/api/admin/companies/{company_id}/approve",
@@ -1765,7 +1785,15 @@ class ApiIntegrationTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(approve_response.status_code, 200, approve_response.text)
+        self.assertEqual(approve_response.status_code, 409, approve_response.text)
+        self.assertEqual(
+            approve_response.json()["detail"]["code"], "COMPANY_PIPELINE_QUALITY_REQUIRED",
+        )
+        self.assertIn("saved_pipeline_quality_missing", approve_response.json()["detail"]["issues"])
+        hydrate.assert_not_called()
+        extract.assert_not_called()
+        provider.assert_not_called()
+        storage_get.assert_not_called()
 
         async def _fetch_company():
             async with async_session() as db:
@@ -1773,16 +1801,17 @@ class ApiIntegrationTests(unittest.TestCase):
                 return result.scalar_one()
 
         company = self.run_async(_fetch_company())
-        self.assertEqual(company.publish_status, PublishStatus.PUBLISHED)
-        self.assertEqual(company.name, "移山科技")
-        self.assertEqual(company.category, "GEO咨询")
-        self.assertTrue(company.short_description)
-        self.assertTrue(company.description)
-        self.assertIn("GEO优化", company.tags or [])
-        self.assertIn("OpenAI API", company.tech_stack or [])
-        self.assertEqual((company.team_members or [{}])[0].get("name"), "张三")
-        self.assertIsNotNone(company.geo_score)
-        self.assertIsNotNone(company.geo_details)
+        self.assertEqual(company.publish_status, PublishStatus.PENDING_REVIEW)
+        self.assertEqual(company.pipeline_status, PipelineStatus.COMPLETED)
+        self.assertEqual(company.name, "missing-profile.example.invalid")
+        self.assertFalse(company.short_description)
+        self.assertFalse(company.description)
+        self.assertFalse(company.tags)
+        self.assertFalse(company.tech_stack)
+        self.assertFalse(company.team_members)
+        self.assertIsNone(company.geo_score)
+        self.assertIsNone(company.geo_details)
+        self.assertIsNone(company.submitted_by)
 
     def test_admin_company_detail_returns_pipeline_and_diagnostic_context(self):
         admin = self.run_async(self._register_user(admin=True))
